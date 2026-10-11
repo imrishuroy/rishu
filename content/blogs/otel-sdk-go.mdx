@@ -1,0 +1,121 @@
+---
+title: "Building Low-Overhead OpenTelemetry SDKs in Go"
+date: "2026-07-20"
+tags: ["Observability", "Go", "OpenTelemetry"]
+summary: "Structuring standardized tracing and metric envelopes without degrading service throughput or bloating P99 response windows."
+readTime: 6
+draft: false
+---
+
+## Why We Built an Internal SDK
+
+At Maersk, 20+ warehouse terminal teams run independent backend services. Each team was implementing observability differently — some using `logrus`, some `zap`, some nothing at all. When a production issue spanned three services, correlating logs was manual and slow.
+
+The goal: a single Go package that any team could drop in and get structured logs, traces, and metrics with zero configuration.
+
+## Design Constraints
+
+1. **Zero overhead on the hot path** — a tracing call must not slow down a 1ms handler to 2ms
+2. **Structured by default** — every log line must have `service`, `trace_id`, `span_id`, `env`
+3. **No vendor lock-in** — output to OTEL Collector; collector decides the backend (Grafana, Datadog, etc.)
+4. **Single import** — `import "github.com/maersk-internal/telemetry"`
+
+## The SDK Structure
+
+```
+telemetry/
+├── telemetry.go      # Init() function, global provider
+├── logger.go         # Structured logger wrapping zap + OTEL bridge
+├── tracer.go         # Tracer helper wrapping otel/trace
+├── metrics.go        # Metric helpers (counter, histogram, gauge)
+└── middleware/
+    └── http.go       # HTTP middleware that auto-instruments handlers
+```
+
+## Initialization
+
+```go
+// In main.go — one call, zero per-request overhead
+func main() {
+    shutdown, err := telemetry.Init(telemetry.Config{
+        ServiceName:    "rdt-scanner-svc",
+        ServiceVersion: version.String(),
+        Environment:    os.Getenv("ENV"),
+        OTELEndpoint:   os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+    })
+    if err != nil {
+        log.Fatalf("telemetry init: %v", err)
+    }
+    defer shutdown(context.Background())
+}
+```
+
+`Init` sets up:
+- A `TracerProvider` with OTLP gRPC exporter + batch span processor
+- A `MeterProvider` with OTLP metric exporter (push interval: 15s)
+- A `zap.Logger` bridged to the OTEL log signal
+
+## Keeping Overhead Minimal
+
+The most common mistake is synchronous span export. The BatchSpanProcessor is critical:
+
+```go
+bsp := sdktrace.NewBatchSpanProcessor(
+    exporter,
+    sdktrace.WithMaxExportBatchSize(512),
+    sdktrace.WithBatchTimeout(5*time.Second),
+    sdktrace.WithMaxQueueSize(2048),
+)
+```
+
+Spans are buffered in memory and exported in background goroutines. The hot path only pays the cost of span creation (a struct allocation) — not network I/O.
+
+For high-volume metrics, use a `sync.Histogram` (pre-aggregated in the SDK, flushed every 15s) instead of a counter per event:
+
+```go
+// Good: one export per flush interval regardless of request count
+latencyHist.Record(ctx, duration.Milliseconds(),
+    attribute.String("endpoint", r.URL.Path),
+)
+
+// Avoid: exporting a data point per request at high rps
+```
+
+## The HTTP Middleware
+
+```go
+func Middleware(next http.Handler) http.Handler {
+    tracer := otel.Tracer("http")
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        ctx, span := tracer.Start(r.Context(), r.URL.Path,
+            trace.WithSpanKind(trace.SpanKindServer),
+        )
+        defer span.End()
+
+        wrapped := &responseWriter{ResponseWriter: w, statusCode: 200}
+        next.ServeHTTP(wrapped, r.WithContext(ctx))
+
+        span.SetAttributes(
+            attribute.Int("http.status_code", wrapped.statusCode),
+            attribute.String("http.method", r.Method),
+        )
+        if wrapped.statusCode >= 500 {
+            span.SetStatus(codes.Error, http.StatusText(wrapped.statusCode))
+        }
+    })
+}
+```
+
+Wrapping `ResponseWriter` to capture the status code is the standard pattern — just remember to delegate `Unwrap()` for compatibility with `http.ResponseController`.
+
+## Benchmark Results
+
+Measured on our RDT ingress service (Go 1.23, ECS Fargate 2vCPU):
+
+| Scenario | P50 latency | P99 latency | CPU delta |
+|---|---|---|---|
+| No telemetry | 1.1ms | 4.2ms | baseline |
+| With SDK (traces + metrics) | 1.2ms | 4.5ms | +1.4% CPU |
+| Naive sync export | 1.1ms | **38ms** | +9% CPU |
+
+The batch processor is the difference between 4.5ms and 38ms at P99.

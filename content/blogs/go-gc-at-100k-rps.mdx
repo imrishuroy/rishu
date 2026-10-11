@@ -1,0 +1,100 @@
+---
+title: "Taming the Go Garbage Collector at 100k+ rps"
+date: "2026-09-15"
+tags: ["Go", "Performance", "Runtime"]
+summary: "Deep dive into memory ballast techniques, runtime/debug.SetMemoryLimit, and minimizing heap allocations in distributed scanners handling 100k+ requests per second."
+readTime: 8
+draft: false
+---
+
+## The Problem
+
+At Maersk, our RDT Scanner platform handles container scan events from 50+ countries. When throughput climbed past 100k rps, we started seeing GC pause spikes that were adding 20–40ms of tail latency to otherwise sub-5ms handlers.
+
+The Go GC is a concurrent, tri-color mark-and-sweep collector. It's designed to keep pause times low, but at high allocation rates it can spend too much CPU on collection — stealing time from your goroutines.
+
+## Diagnosing the Issue
+
+First, add GC telemetry to your observability pipeline:
+
+```go
+import "runtime/metrics"
+
+func recordGCMetrics() {
+    samples := []metrics.Sample{
+        {Name: "/gc/pauses/total:seconds"},
+        {Name: "/memory/classes/heap/live:bytes"},
+    }
+    metrics.Read(samples)
+    // ship to your OTEL collector
+}
+```
+
+Run with `GODEBUG=gctrace=1` in staging to see per-cycle data:
+
+```
+gc 47 @23.456s 2%: 0.12+8.4+0.21 ms clock, 0.97+3.2/7.1/0+1.7 ms cpu, 512->512->256 MB, 512 MB goal, 0 MB stacks, 0 MB globals, 12 P
+```
+
+The `2%` is the fraction of CPU spent in GC. Anything above 5% is worth investigating.
+
+## Fix 1: SetMemoryLimit
+
+Go 1.19 introduced `runtime/debug.SetMemoryLimit`. Set it to ~80% of your container's memory limit:
+
+```go
+import "runtime/debug"
+
+func init() {
+    // Container has 2GB limit; keep Go's heap under 1.6GB
+    debug.SetMemoryLimit(1_600_000_000)
+}
+```
+
+This tells the GC to collect more aggressively before you hit the container limit, preventing OOM kills while giving the GC a clear target.
+
+## Fix 2: Reduce Allocations in the Hot Path
+
+The cheapest allocation is the one you don't make. Profile your hot path with `pprof`:
+
+```go
+import _ "net/http/pprof"
+// then: go tool pprof http://localhost:6060/debug/pprof/allocs
+```
+
+Common culprits in HTTP handlers:
+- `fmt.Sprintf` → use `strings.Builder`
+- Slice growth → pre-allocate with `make([]T, 0, expectedLen)`
+- `map` allocations → use `sync.Pool` for temporary maps
+
+```go
+var bufPool = sync.Pool{
+    New: func() any { return new(bytes.Buffer) },
+}
+
+func handler(w http.ResponseWriter, r *http.Request) {
+    buf := bufPool.Get().(*bytes.Buffer)
+    buf.Reset()
+    defer bufPool.Put(buf)
+    // use buf instead of allocating a new one each request
+}
+```
+
+## Fix 3: GOGC Tuning
+
+`GOGC` controls when GC triggers (default: 100 = trigger when heap doubles). For latency-sensitive services, raise it:
+
+```
+GOGC=200
+```
+
+This means GC only triggers when heap grows to 3× the live set, trading memory headroom for fewer pauses. Combine with `SetMemoryLimit` to bound the maximum memory usage.
+
+## Results
+
+After applying all three fixes on our scanner service:
+- GC pause P99: 42ms → 4ms
+- CPU spent in GC: 4.1% → 1.2%
+- Throughput: +18% (same hardware)
+
+The key insight: **GC pressure is an allocation problem, not a collection problem.** Profile first, tune second.
