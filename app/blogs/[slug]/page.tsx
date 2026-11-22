@@ -1,9 +1,10 @@
 import { notFound } from 'next/navigation'
 import type { Metadata } from 'next'
-import { getAllPosts, getPostBySlug } from '@/lib/posts'
+import { getAllPosts, getPostBySlug, getSeriesPosts } from '@/lib/posts'
 import { safeIsoDate } from '@/lib/utils'
 import PostHeader from '@/components/blog/PostHeader'
 import MdxContent from '@/components/blog/MdxContent'
+import SeriesNav from '@/components/blog/SeriesNav'
 
 interface PageProps {
   params: Promise<{ slug: string }>
@@ -35,12 +36,22 @@ export default async function BlogPostPage({ params }: PageProps) {
   const post = getPostBySlug(slug)
   if (!post) notFound()
 
+  const totalInSeries = post.series ? getSeriesPosts(post.series).length : 0
+
   return (
     <div className="max-w-3xl mx-auto px-6 py-10">
       <PostHeader post={post} />
       <div className="mt-10">
         <MdxContent source={post.content} />
       </div>
+      {post.series && (
+        <SeriesNav
+          currentSlug={post.slug}
+          series={post.series}
+          order={post.seriesOrder}
+          totalInSeries={totalInSeries}
+        />
+      )}
     </div>
   )
 }

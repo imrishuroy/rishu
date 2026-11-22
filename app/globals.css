@@ -107,6 +107,104 @@
   padding: 0.125rem 0.375rem;
   border-radius: 0.25rem;
   border: 1px solid rgba(255,255,255,0.08);
+  white-space: nowrap;
+}
+
+/* GFM tables */
+.mdx-content table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.5rem 0;
+  font-size: 0.9375rem;
+  color: #bcc8cf;
+}
+
+.mdx-content thead tr {
+  border-bottom: 1px solid rgba(255,255,255,0.12);
+}
+
+.mdx-content th {
+  color: #e1e2ec;
+  font-weight: 600;
+  text-align: left;
+  padding: 0.625rem 1rem;
+}
+
+.mdx-content td {
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+}
+
+.mdx-content tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.mdx-content tbody tr:hover td {
+  background: rgba(255,255,255,0.02);
+}
+
+/* Mermaid diagrams */
+.mermaid-diagram svg {
+  /* width/height are set inline by makeResponsiveSvg() — just ensure overflow
+     is visible so drop-shadows don't get clipped at the SVG boundary */
+  overflow: visible;
+  font-family: var(--font-inter), Inter, system-ui, sans-serif !important;
+}
+
+/* Override font and color on foreignObject / htmlLabels */
+.mermaid-diagram .label,
+.mermaid-diagram .nodeLabel,
+.mermaid-diagram .edgeLabel,
+.mermaid-diagram .cluster-label .nodeLabel {
+  font-family: var(--font-inter), Inter, system-ui, sans-serif !important;
+  color: #e1e2ec !important;
+}
+
+.mermaid-diagram text {
+  font-family: var(--font-inter), Inter, system-ui, sans-serif !important;
+  fill: #e1e2ec !important;
+}
+
+/* Reset mdx-content p styles that bleed into Mermaid html labels */
+.mermaid-diagram .nodeLabel p,
+.mermaid-diagram .label p,
+.mermaid-diagram .edgeLabel p {
+  color: #e1e2ec !important;
+  margin-bottom: 0 !important;
+  font-size: inherit !important;
+  line-height: inherit !important;
+}
+
+/* Edge label pill */
+.mermaid-diagram .edgeLabel rect {
+  opacity: 0.85 !important;
+  rx: 4 !important;
+}
+
+/* Cluster label text */
+.mermaid-diagram .cluster-label text,
+.mermaid-diagram .cluster-label .nodeLabel {
+  fill: #adc6ff !important;
+  color: #adc6ff !important;
+}
+
+/* Subtle cyan glow on flowchart nodes */
+.mermaid-diagram .node rect,
+.mermaid-diagram .node circle,
+.mermaid-diagram .node ellipse,
+.mermaid-diagram .node polygon,
+.mermaid-diagram .node path {
+  filter: drop-shadow(0 0 8px rgba(92, 212, 255, 0.10));
+}
+
+/* Sequence diagram lifeline */
+.mermaid-diagram .actor {
+  stroke-width: 1.5px !important;
+}
+
+/* Smooth the edge paths */
+.mermaid-diagram .flowchart-link {
+  stroke-width: 1.75px !important;
 }
 
 /* Material Symbols size fix */

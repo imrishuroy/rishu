@@ -1,0 +1,909 @@
+---
+title: "Scaling Reads 01: The Baseline"
+date: "2026-10-17"
+tags: ["Go", "PostgreSQL", "Performance", "System Design", "k6"]
+summary: "Build the naive server with a single Postgres instance and raw queries. Instrument it, run a load test, expose the N+1 problem, and fix it with connection pooling and query batching."
+readTime: 26
+draft: false
+---
+
+Your feed endpoint works fine in development. Ten users, a handful of posts, queries return in 2ms. You deploy it. Traffic grows to 200 concurrent users. The p99 latency (the value that 99% of requests fall below) climbs to 800ms. At 500 concurrent users it crosses 4 seconds. You add a server. Nothing improves.
+
+The problem is not concurrency. It is that every feed request fires one query per followed user to fetch their posts. Follow 80 accounts and you get 81 database round-trips per request. Under load, those pile up and saturate the database. The fix is a single query. But you cannot optimize what you cannot measure, and you cannot measure without baselines.
+
+This post builds the dumbest possible implementation, instruments it from day one, shows exactly where it breaks, and applies two fixes: connection pooling and query batching.
+
+The remaining 15 posts in this series add layers on top of this foundation. Every optimization is motivated by a measured bottleneck in this baseline. Do not skip this post.
+
+**Prerequisites:** Go 1.23+, Docker and Docker Compose, basic familiarity with SQL and HTTP. You do not need to understand Postgres internals deeply. The posts that require them introduce the concepts inline.
+
+**Companion repo:** All code is at [imrishuroy/scaling-reads](https://github.com/imrishuroy/scaling-reads). This post covers tag `v0.1.0`.
+
+**Correctness invariant:** After an acknowledged write, the writer's own subsequent read must return that write or a newer state. It must not silently return an older value.
+
+## Tools You Need
+
+Install these before starting. Each command below is the fastest path on the two most common platforms.
+
+### Go 1.23+
+
+The application code and seed tool are written in Go. Install from the official site at [go.dev/dl](https://go.dev/dl/). Download the package for your OS, run the installer, and follow the prompts.
+
+**macOS:** Download the `.pkg` installer for your architecture (Intel or Apple Silicon), open it, and follow the steps. The installer places Go at `/usr/local/go` and updates your `PATH` automatically.
+
+**Linux:**
+```bash
+curl -LO https://go.dev/dl/go1.23.2.linux-amd64.tar.gz
+sudo rm -rf /usr/local/go
+sudo tar -C /usr/local -xzf go1.23.2.linux-amd64.tar.gz
+echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+source ~/.bashrc
+```
+
+Use `linux-arm64` instead of `linux-amd64` if you are on an ARM machine. The `rm -rf` removes any previously installed Go version to avoid a broken mixed installation.
+
+Verify: `go version` should print `go1.23.2` or newer.
+
+### Docker Desktop (includes Compose)
+
+Docker runs Postgres, Prometheus, and Grafana locally. You do not need a cloud account.
+
+**macOS / Windows:** Download from [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/). After installing, start Docker Desktop and verify:
+```bash
+docker version
+docker compose version
+```
+
+**Linux:** Install the Docker Engine and the Compose plugin:
+```bash
+sudo apt-get update
+sudo apt-get install -y docker.io docker-compose-plugin
+# allow running docker without sudo (re-login after this)
+sudo usermod -aG docker $USER
+```
+
+### k6 (Load Testing Tool)
+
+k6 runs the constant-arrival-rate load tests used throughout the series.
+
+**macOS:**
+```bash
+brew install k6
+```
+
+**Linux:**
+```bash
+sudo gpg -k
+sudo gpg \
+  --no-default-keyring \
+  --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
+  --keyserver hkp://keyserver.ubuntu.com:80 \
+  --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+
+echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] \
+  https://dl.k6.io/deb stable main" \
+  | sudo tee /etc/apt/sources.list.d/k6.list
+
+sudo apt-get update
+sudo apt-get install k6
+```
+
+**Windows:** `winget install k6 --source winget`
+
+Verify: `k6 version`
+
+### psql, Postgres CLI Client (optional)
+
+You need `psql` only to run the `pg_stat_statements` queries and `EXPLAIN ANALYZE` commands shown in this post. The Postgres container exposes port 5432, so any local client works.
+
+**macOS:**
+```bash
+brew install libpq
+echo 'export PATH="/opt/homebrew/opt/libpq/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+**Linux:**
+```bash
+sudo apt-get install -y postgresql-client
+```
+
+Connect to the running container:
+```bash
+psql -h localhost -p 5432 -U postgres -d scaling_reads
+```
+
+The password is `postgres` (set in `docker-compose.yml`).
+
+## The Reference System
+
+This series uses a profile and feed service: a minimal social network read path, modeled after the read-heavy parts of Twitter or LinkedIn.
+
+Three tables:
+
+```sql
+-- migrations/001_initial.sql
+CREATE TABLE users (
+    id          BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    username    TEXT NOT NULL UNIQUE,
+    bio         TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted_at  TIMESTAMPTZ
+);
+
+CREATE TABLE posts (
+    id          BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    author_id   BIGINT NOT NULL REFERENCES users(id),
+    body        TEXT NOT NULL,
+    visibility  TEXT NOT NULL DEFAULT 'public'
+                    CHECK (visibility IN ('public', 'private')),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted_at  TIMESTAMPTZ
+);
+
+CREATE TABLE follows (
+    follower_id BIGINT NOT NULL REFERENCES users(id),
+    followee_id BIGINT NOT NULL REFERENCES users(id),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (follower_id, followee_id)
+);
+```
+
+Three read endpoints:
+
+- `GET /users/:id`: profile lookup. Same data, potentially millions of reads.
+- `GET /feed/:userId`: feed assembled from posts by followed users. Expensive, the classic fan-out problem.
+- `GET /posts/:id`: single post lookup.
+
+### Repository Layout
+
+```text
+scaling-reads/
+|-- cmd/
+|   |-- server/        HTTP server entry point
+|   `-- seed/          Dataset seed tool
+|-- internal/
+|   |-- store/         Database layer (evolves across posts)
+|   |-- metrics/       Prometheus metric definitions
+|   `-- server/        HTTP handlers and middleware
+|-- migrations/        SQL schema files
+|-- load/              k6 scripts and fixture data
+`-- docker-compose.yml Base services (Postgres, Prometheus, Grafana)
+```
+
+Each post links to its corresponding git tag. The code at `v0.1.0` covers exactly what this post describes.
+
+Start the baseline:
+
+```bash
+git clone https://github.com/imrishuroy/scaling-reads
+cd scaling-reads
+git checkout v0.1.0
+docker compose up -d
+go run ./cmd/server
+```
+
+The server starts on `:8080`. Postgres runs on `:5432`. The seed script loads 1,000 users, 50,000 posts, and a follow graph with a power-law distribution. Most users follow 20 to 50 accounts, a small number follow 500+.
+
+```bash
+go run ./cmd/seed \
+  --users 1000 \
+  --posts 50000 \
+  --follows-mean 40 \
+  --follows-max 500
+```
+
+## What p50, p95, and p99 Mean
+
+A load test collects thousands of request latencies. You cannot reason about a list of 100,000 numbers. Percentiles summarize the distribution.
+
+**p50 (median):** The latency that 50% of requests fall below. If p50 is 20ms, half your requests complete in 20ms or less.
+
+**p95:** 95% of requests complete below this threshold. 1 in 20 requests takes longer.
+
+**p99:** 99% of requests complete below this threshold. 1 in 100 requests takes longer. This is the number that matters for user experience. Every active user will eventually be that 1 in 100.
+
+Averages are dangerous. If 99 requests complete in 10ms and one takes 10 seconds, the average is about 110ms, a number that accurately describes no single request and conceals the problem entirely. Use percentiles.
+
+The p99 is where slow queries, lock contention, and connection exhaustion first appear. Optimizing for p50 while ignoring p99 is optimizing for the best case.
+
+## The Naive Implementation
+
+### HTTP Server Setup
+
+The server uses Go's standard library `net/http` with the pattern-based routing added in Go 1.22. No external router framework is needed.
+
+```go
+// internal/server/server.go
+package server
+
+import (
+    "net/http"
+    "github.com/imrishuroy/scaling-reads/internal/store"
+)
+
+type Server struct {
+    store *store.Store
+}
+
+func New(st *store.Store) *Server {
+    return &Server{store: st}
+}
+
+func (s *Server) Routes() http.Handler {
+    mux := http.NewServeMux()
+    mux.HandleFunc("GET /users/{id}",
+        InstrumentedHandler("/users/:id", s.handleGetUser))
+    mux.HandleFunc("GET /feed/{userId}",
+        InstrumentedHandler("/feed/:userId", s.handleFeed))
+    mux.HandleFunc("GET /posts/{id}",
+        InstrumentedHandler("/posts/:id", s.handleGetPost))
+    return mux
+}
+```
+
+`{id}` and `{userId}` are wildcard segments in Go 1.22+ routing. Inside the handler, `r.PathValue("id")` retrieves the matched value for that segment. `r.PathValue` is part of the standard library. No third-party router is required.
+
+The entry point wires everything together:
+
+```go
+// cmd/server/main.go
+package main
+
+import (
+    "context"
+    "log"
+    "net/http"
+    _ "net/http/pprof"
+
+    "github.com/prometheus/client_golang/prometheus/promhttp"
+    "github.com/imrishuroy/scaling-reads/internal/server"
+    "github.com/imrishuroy/scaling-reads/internal/store"
+)
+
+func main() {
+    ctx := context.Background()
+
+    dsn := "postgres://postgres:postgres@localhost:5432/scaling_reads"
+    st, err := store.New(ctx, dsn)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    srv := server.New(st)
+    mux := srv.Routes()
+
+    // Prometheus metrics endpoint
+    http.Handle("/metrics", promhttp.Handler())
+
+    // pprof profiling endpoint on a separate port
+    go func() { log.Println(http.ListenAndServe(":6060", nil)) }()
+
+    log.Println("listening on :8080")
+    log.Fatal(http.ListenAndServe(":8080", mux))
+}
+```
+
+The DSN (Data Source Name) is the connection string Postgres uses to identify the host, port, database name, and credentials.
+
+### The Naive Store
+
+The naive store opens a single `pgx` connection at startup.
+
+```go
+// internal/store/store.go
+package store
+
+import (
+    "context"
+    "github.com/jackc/pgx/v5"
+)
+
+type Store struct {
+    conn *pgx.Conn
+}
+
+func New(ctx context.Context, dsn string) (*Store, error) {
+    conn, err := pgx.Connect(ctx, dsn)
+    if err != nil {
+        return nil, err
+    }
+    return &Store{conn: conn}, nil
+}
+```
+
+A single `pgx.Conn` processes one query at a time. Two concurrent HTTP requests share this connection, serializing their database work. Under any real load, requests queue waiting for the connection.
+
+The profile endpoint is straightforward:
+
+```go
+// internal/store/users.go
+func (s *Store) GetUser(ctx context.Context, id int64) (*User, error) {
+    var u User
+    err := s.conn.QueryRow(ctx,
+        `SELECT id, username, bio, created_at
+         FROM users
+         WHERE id = $1 AND deleted_at IS NULL`,
+        id,
+    ).Scan(&u.ID, &u.Username, &u.Bio, &u.CreatedAt)
+    if err != nil {
+        return nil, err
+    }
+    return &u, nil
+}
+```
+
+The feed endpoint is where the N+1 problem lives:
+
+```go
+// internal/store/feed.go
+package store
+
+import (
+    "context"
+    "sort"
+)
+
+func (s *Store) GetFeed(
+    ctx context.Context, userID int64, limit int,
+) ([]Post, error) {
+    // Query 1: get the IDs of users this person follows
+    followRows, err := s.conn.Query(ctx,
+        `SELECT followee_id FROM follows WHERE follower_id = $1`,
+        userID,
+    )
+    if err != nil {
+        return nil, err
+    }
+    var followeeIDs []int64
+    for followRows.Next() {
+        var id int64
+        if err := followRows.Scan(&id); err != nil {
+            return nil, err
+        }
+        followeeIDs = append(followeeIDs, id)
+    }
+    followRows.Close()
+    if err := followRows.Err(); err != nil {
+        return nil, err
+    }
+
+    // Queries 2..N+1: one query per followed user
+    var posts []Post
+    for _, authorID := range followeeIDs {
+        postRows, err := s.conn.Query(ctx,
+            `SELECT id, author_id, body, created_at
+             FROM posts
+             WHERE author_id = $1 AND deleted_at IS NULL
+             ORDER BY created_at DESC
+             LIMIT $2`,
+            authorID, limit,
+        )
+        if err != nil {
+            return nil, err
+        }
+        for postRows.Next() {
+            var p Post
+            if err := postRows.Scan(
+                &p.ID, &p.AuthorID, &p.Body, &p.CreatedAt,
+            ); err != nil {
+                return nil, err
+            }
+            posts = append(posts, p)
+        }
+        postRows.Close()
+        if err := postRows.Err(); err != nil {
+            return nil, err
+        }
+    }
+
+    sort.Slice(posts, func(i, j int) bool {
+        return posts[i].CreatedAt.After(posts[j].CreatedAt)
+    })
+    if len(posts) > limit {
+        posts = posts[:limit]
+    }
+    return posts, nil
+}
+```
+
+If a user follows 80 accounts, this fires 81 queries per feed request. Under load, those 81 queries stack up across concurrent requests, saturating the connection and then the database.
+
+**N+1 query:** A pattern where N+1 database round-trips are made to fetch data that could be assembled in one or two queries. The extra N round-trips create latency and load that scales with the size of the list, not with the number of requests.
+
+## Instrumentation from Day One
+
+You cannot optimize what you cannot measure. Add metrics before the first load test.
+
+The metrics use the [Prometheus](https://prometheus.io) client library. `promauto` is a helper package that registers metrics automatically at declaration time, removing the need to call `prometheus.MustRegister` manually.
+
+```go
+// internal/metrics/metrics.go
+package metrics
+
+import (
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+var RequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+    Name:    "http_request_duration_seconds",
+    Help:    "HTTP request latency by route and status.",
+    Buckets: prometheus.DefBuckets,
+}, []string{"route", "status"})
+
+var DBQueryDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+    Name:    "db_query_duration_seconds",
+    Help:    "Database query latency by operation.",
+    Buckets: prometheus.DefBuckets,
+}, []string{"op"})
+
+var PoolAcquireDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+    Name:    "db_pool_acquire_duration_seconds",
+    Help:    "Time waiting to acquire a connection from the pool.",
+    Buckets: prometheus.DefBuckets,
+})
+```
+
+The HTTP middleware records per-route latency. Use route templates (`/users/:id`), not actual user IDs. User IDs as metric labels create unbounded cardinality: one label value per user, which exhausts memory in Prometheus.
+
+```go
+// internal/server/middleware.go
+package server
+
+import (
+    "net/http"
+    "strconv"
+    "time"
+
+    "github.com/imrishuroy/scaling-reads/internal/metrics"
+)
+
+// statusWriter captures the HTTP status code written by a handler.
+// http.ResponseWriter does not expose the status code after the fact,
+// so we wrap it.
+type statusWriter struct {
+    http.ResponseWriter
+    code int
+}
+
+func (sw *statusWriter) WriteHeader(code int) {
+    sw.code = code
+    sw.ResponseWriter.WriteHeader(code)
+}
+
+func InstrumentedHandler(route string, h http.HandlerFunc) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
+        rw := &statusWriter{ResponseWriter: w, code: 200}
+        h(rw, r)
+        metrics.RequestDuration.WithLabelValues(
+            route,
+            strconv.Itoa(rw.code),
+        ).Observe(time.Since(start).Seconds())
+    }
+}
+```
+
+Instrument the database layer separately. Pool acquisition time plus query execution time equals the total database contribution to request latency. If acquisition time is high, you need more connections or fewer concurrent requests. If query execution time is high, you need better queries or indexes.
+
+```go
+// internal/store/feed.go
+func (s *Store) GetFeed(
+    ctx context.Context, userID int64, limit int,
+) ([]Post, error) {
+    start := time.Now()
+    defer func() {
+        metrics.DBQueryDuration.
+            WithLabelValues("get_feed").
+            Observe(time.Since(start).Seconds())
+    }()
+    // ...
+}
+```
+
+Expose metrics at `GET /metrics`. The `docker-compose.yml` at v0.1.0 includes Prometheus and Grafana configured to scrape it.
+
+### pg_stat_statements
+
+Enable `pg_stat_statements` in Postgres to see which queries are slow and how often they run:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+SELECT
+    query,
+    calls,
+    round(total_exec_time::numeric, 2)  AS total_ms,
+    round(mean_exec_time::numeric, 2)   AS mean_ms,
+    round(stddev_exec_time::numeric, 2) AS stddev_ms,
+    rows
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 10;
+```
+
+After a load test, this view will show the posts-by-author query with thousands of calls, one per followed user per feed request. That call count is the N+1 problem made visible.
+
+### Bounded Context Deadlines
+
+Every database call needs a deadline. Without one, a slow query blocks a goroutine indefinitely. Under load, slow queries accumulate, goroutines pile up, and the process runs out of memory.
+
+```go
+func (s *Store) GetUser(ctx context.Context, id int64) (*User, error) {
+    ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+    defer cancel()
+
+    var u User
+    err := s.conn.QueryRow(ctx,
+        `SELECT id, username, bio, created_at
+         FROM users
+         WHERE id = $1 AND deleted_at IS NULL`,
+        id,
+    ).Scan(&u.ID, &u.Username, &u.Bio, &u.CreatedAt)
+    if err != nil {
+        return nil, err
+    }
+    return &u, nil
+}
+```
+
+Five seconds is generous. The right value depends on your SLA (Service Level Agreement, the latency commitment your service makes to its callers). If the feed endpoint must respond in 500ms end-to-end, the database deadline should be tighter, leaving room for serialization, network, and retry.
+
+Pass `r.Context()` from the HTTP handler down to every database call, and compose deadlines on top of it. Never use `context.Background()` inside a request handler.
+
+```go
+func (s *Server) handleFeed(w http.ResponseWriter, r *http.Request) {
+    userID, err := strconv.ParseInt(r.PathValue("userId"), 10, 64)
+    if err != nil {
+        http.Error(w, "invalid user id", http.StatusBadRequest)
+        return
+    }
+
+    posts, err := s.store.GetFeed(r.Context(), userID, 20)
+    if err != nil {
+        if errors.Is(err, context.Canceled) {
+            return
+        }
+        http.Error(w, "internal error", http.StatusInternalServerError)
+        return
+    }
+    // ...
+}
+```
+
+When a client disconnects, `r.Context()` is canceled. If that cancellation propagates to the database call, Postgres cancels the query. Without it, the query runs to completion, consuming a connection and Postgres CPU for a response nobody will read.
+
+## The First Load Test
+
+### Open-Loop vs Closed-Loop
+
+Two modes of load testing produce very different results, and confusing them leads to wrong conclusions.
+
+**Closed-loop (constant concurrency):** You maintain N virtual users, each sending the next request as soon as the previous one completes. If the server slows down, each virtual user spends more time waiting for responses. The actual arrival rate falls as the server slows, exactly the opposite of what real users do. When the server is overloaded and requests take 10 seconds each, a closed-loop test with 50 VUs sends 5 requests per second, not 50. The service appears to be handling load fine.
+
+**Open-loop (constant arrival rate):** You send requests at a fixed rate regardless of how long previous requests take. If the server slows down, requests arrive faster than they complete, queues grow, and latency climbs. This is how real users behave. HTTP clients do not wait for your previous request to finish before a new user sends theirs.
+
+**Coordinated omission:** The measurement error that occurs when a closed-loop test avoids measuring the latency that real users experience, because it slows its own arrival rate as the server slows. Named by Gil Tene in 2015. A service that takes 10 seconds per request under load looks fine in a closed-loop test because the test itself slows down to match. The overload condition, and the latency that real users would see, is invisible.
+
+Use constant-arrival-rate (open-loop) tests when you want to find where a service breaks. Use closed-loop tests when you want to model a fixed population of users with predictable, think-time-bounded behavior.
+
+### k6 Scenario
+
+```javascript
+// load/baseline-feed.js
+import http from 'k6/http';
+import { check } from 'k6';
+
+export const options = {
+  scenarios: {
+    feed_reads: {
+      executor: 'constant-arrival-rate',
+      rate: 200,
+      timeUnit: '1s',
+      duration: '2m',
+      preAllocatedVUs: 50,
+      maxVUs: 200,
+    },
+  },
+  thresholds: {
+    http_req_duration: ['p(99)<500'],
+    http_req_failed: ['rate<0.01'],
+  },
+};
+
+const USER_IDS = JSON.parse(open('../load/fixtures/user_ids.json'));
+
+export default function () {
+  const uid = USER_IDS[Math.floor(Math.random() * USER_IDS.length)];
+  const res = http.get(`http://localhost:8080/feed/${uid}?limit=20`);
+  check(res, { 'status 200': (r) => r.status === 200 });
+}
+```
+
+Run with:
+
+```bash
+k6 run load/baseline-feed.js
+```
+
+**Test environment (v0.1.0 results):**
+- MacBook Pro M2, 8-core, 16GB RAM
+- Docker Desktop: 4 CPUs, 8GB RAM allocated
+- Postgres 16.3 Alpine, default configuration
+- Go 1.23.2, linux/arm64
+- Dataset: 1,000 users, 50,000 posts, mean 40 follows per user
+- Warm-up: 30 seconds at 20 RPS before the measurement window
+- Measurement window: 90 seconds
+
+**Naive single-connection implementation at 200 RPS offered load:**
+
+| Metric | Observed |
+|---|---|
+| Offered rate | 200 RPS |
+| Achieved rate | ~18 RPS |
+| p50 | 4.8s |
+| p99 | 8.2s |
+| Error rate | 31% (context deadline exceeded) |
+| Dropped iterations | 164 of 200 |
+
+The single connection serializes every request. Achieved throughput collapses to 9% of offered load. Most requests timeout before the connection becomes available.
+
+Your numbers will differ based on hardware and Docker resource allocation. The shape is the same: a single connection cannot serve concurrent requests.
+
+## Fix 1: Connection Pooling with pgxpool
+
+A **connection pool** maintains multiple database connections and lends them to goroutines on demand. A goroutine that needs a connection takes one from the pool and returns it when the query completes. Goroutines that find the pool exhausted block until a connection is available or a deadline fires.
+
+`pgxpool` is the connection pool bundled with `pgx`. Replace the single connection:
+
+```go
+// internal/store/store.go
+package store
+
+import (
+    "context"
+    "time"
+    "github.com/jackc/pgx/v5/pgxpool"
+)
+
+type Store struct {
+    pool *pgxpool.Pool
+}
+
+func New(ctx context.Context, dsn string) (*Store, error) {
+    cfg, err := pgxpool.ParseConfig(dsn)
+    if err != nil {
+        return nil, err
+    }
+
+    cfg.MaxConns          = 20
+    cfg.MinConns          = 5
+    cfg.MaxConnLifetime   = 30 * time.Minute
+    cfg.MaxConnIdleTime   = 5 * time.Minute
+
+    pool, err := pgxpool.NewWithConfig(ctx, cfg)
+    if err != nil {
+        return nil, err
+    }
+    return &Store{pool: pool}, nil
+}
+```
+
+The store methods call the pool directly. `pgxpool` acquires a connection, runs the query, and returns the connection to the pool when the rows are closed or the scan completes.
+
+```go
+func (s *Store) GetUser(ctx context.Context, id int64) (*User, error) {
+    ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+    defer cancel()
+
+    var u User
+    err := s.pool.QueryRow(ctx,
+        `SELECT id, username, bio, created_at
+         FROM users
+         WHERE id = $1 AND deleted_at IS NULL`,
+        id,
+    ).Scan(&u.ID, &u.Username, &u.Bio, &u.CreatedAt)
+    if err != nil {
+        return nil, err
+    }
+    return &u, nil
+}
+```
+
+For `GetFeed`, measure pool acquisition time separately from query execution time so you can distinguish the two in metrics:
+
+```go
+func (s *Store) GetFeed(
+    ctx context.Context, userID int64, limit int,
+) ([]Post, error) {
+    acquireStart := time.Now()
+    conn, err := s.pool.Acquire(ctx)
+    if err != nil {
+        return nil, err
+    }
+    defer conn.Release()
+    metrics.PoolAcquireDuration.Observe(time.Since(acquireStart).Seconds())
+
+    queryStart := time.Now()
+    defer func() {
+        metrics.DBQueryDuration.
+            WithLabelValues("get_feed").
+            Observe(time.Since(queryStart).Seconds())
+    }()
+    // ... rest of the queries ...
+}
+```
+
+**pgxpool at MaxConns=20, 200 RPS offered load:**
+
+| Metric | Observed |
+|---|---|
+| Offered rate | 200 RPS |
+| Achieved rate | ~160 RPS |
+| p50 | 280ms |
+| p99 | 1.9s |
+| Error rate | 3.2% (pool exhaustion) |
+| Dropped iterations | 40 of 200 |
+
+Significantly better. But the N+1 problem is still here. Each feed request still fires 40+ queries. At 160 RPS, the database is handling 6,400+ queries per second.
+
+### Why More Connections Is Not Always Better
+
+Increasing `MaxConns` to 100 does not linearly improve throughput. Each Postgres connection consumes a backend process, roughly 5 to 10MB at default settings plus the memory for its working buffers. A database instance with 100 active connections may spend more time managing lock contention and shared memory access than executing queries.
+
+A practical starting point for OLTP (Online Transaction Processing, meaning short frequent read/write operations as opposed to analytics workloads) workloads: `MaxConns = (number of database CPUs * 2) + 1`. Measure pool acquisition wait time from the `PoolAcquireDuration` metric. If acquisition wait is consistently high and CPU is not saturated, the pool is too small. If CPU is saturated and adding connections does not help, the bottleneck is query throughput, not connection count.
+
+Postgres also has its own `max_connections` setting, default 100. Your pool's `MaxConns` must be smaller than `max_connections` minus connections reserved for maintenance and monitoring. At `max_connections=100`, leave at least 5 connections for superuser tasks like `pg_stat_activity` queries and `VACUUM`.
+
+## Fix 2: Query Batching
+
+The fix for N+1 is a query that fetches all required data in one round-trip:
+
+```go
+// internal/store/feed.go
+func (s *Store) GetFeed(
+    ctx context.Context, userID int64, limit int,
+) ([]Post, error) {
+    ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+    defer cancel()
+
+    rows, err := s.pool.Query(ctx, `
+        SELECT p.id, p.author_id, p.body, p.created_at
+        FROM posts p
+        JOIN follows f ON f.followee_id = p.author_id
+        WHERE f.follower_id = $1
+          AND p.deleted_at IS NULL
+          AND p.visibility = 'public'
+        ORDER BY p.created_at DESC, p.id DESC
+        LIMIT $2
+    `, userID, limit)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+
+    var posts []Post
+    for rows.Next() {
+        var p Post
+        if err := rows.Scan(
+            &p.ID, &p.AuthorID, &p.Body, &p.CreatedAt,
+        ); err != nil {
+            return nil, err
+        }
+        posts = append(posts, p)
+    }
+    return posts, rows.Err()
+}
+```
+
+The JOIN replaces 80 individual lookups. Postgres handles the join in a single execution plan rather than across 81 network round-trips.
+
+When you have a list of IDs rather than a join relationship, use `ANY($1)` with a slice parameter:
+
+```go
+ids := []int64{1, 2, 3, 4, 5}
+rows, err := pool.Query(ctx,
+    `SELECT id, author_id, body, created_at
+     FROM posts
+     WHERE author_id = ANY($1)
+       AND deleted_at IS NULL
+     ORDER BY created_at DESC, id DESC
+     LIMIT $2`,
+    ids, limit,
+)
+```
+
+`ANY($1)` with a `[]int64` is the idiomatic pgx approach for in-list queries. Avoid building a SQL string with `IN (?, ?, ?, ...)`, because each distinct parameter count generates a separate query plan. `ANY($1)` reuses a single prepared statement regardless of slice length.
+
+**Query batching:** Replacing N individual queries with one query that retrieves all N items in a single round-trip. The database executes one plan. The application pays one network latency. For read-heavy services, this is frequently the highest-impact optimization available before adding any infrastructure.
+
+**pgxpool + batched JOIN at 200 RPS offered load:**
+
+| Metric | Observed |
+|---|---|
+| Offered rate | 200 RPS |
+| Achieved rate | 198 RPS |
+| p50 | 18ms |
+| p99 | 62ms |
+| Error rate | 0.1% |
+| Dropped iterations | 2 of 200 |
+
+p99 dropped from 1.9 seconds to 62 milliseconds. The improvement is from eliminating 40+ database round-trips per request, not from new infrastructure. One query replaced 41.
+
+Check `pg_stat_statements` after this test to confirm the query is using the right indexes. The JOIN on `follows.follower_id` and `posts.author_id` needs:
+
+```sql
+CREATE INDEX idx_follows_follower ON follows (follower_id);
+CREATE INDEX idx_posts_author_created ON posts (author_id, created_at DESC)
+    WHERE deleted_at IS NULL;
+```
+
+Verify the planner uses them:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT p.id, p.author_id, p.body, p.created_at
+FROM posts p
+JOIN follows f ON f.followee_id = p.author_id
+WHERE f.follower_id = 1
+  AND p.deleted_at IS NULL
+  AND p.visibility = 'public'
+ORDER BY p.created_at DESC, p.id DESC
+LIMIT 20;
+```
+
+Look for `Index Scan` or `Index Only Scan`, not `Seq Scan`. If you see a sequential scan, add the indexes and run `ANALYZE` to update planner statistics. Post 2 covers how indexes work, what they cost, and when the planner will or will not use them.
+
+## Go Profiling
+
+Enable Go's built-in profiler for production diagnosis. CPU profiles from a live load test show exactly where goroutine time is spent.
+
+```go
+// cmd/server/main.go
+import _ "net/http/pprof"
+
+// in main():
+go func() {
+    log.Println(http.ListenAndServe(":6060", nil))
+}()
+```
+
+Capture a CPU profile during a load test:
+
+```bash
+go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30
+```
+
+In the naive implementation, the profile will show most time in `net.(*conn).Read` and `net.(*conn).Write`, waiting on network I/O for database round-trips. After batching, that time collapses. The profiler confirms what the metrics already show.
+
+## Tradeoffs
+
+Nothing in this post is free.
+
+**Connection pooling** trades memory for throughput. Each pooled connection holds open a Postgres backend process (roughly 5 to 10MB). A pool of 20 connections adds 100 to 200MB to Postgres memory. Larger pools cost more memory and can increase lock contention on Postgres shared data structures. There is a connection count past which adding more connections slows the database.
+
+**Query batching via JOIN** moves work to the database. A join across large tables may be more expensive than many individual indexed lookups, depending on the query plan, data distribution, and statistics. Use `EXPLAIN (ANALYZE, BUFFERS)` to verify the planner makes the right choice before benchmarking.
+
+**`ANY($1)` with a large array** can create a large plan for the planner to evaluate. For arrays with more than 1,000 elements, measure whether splitting into smaller batches is faster.
+
+These tradeoffs are why every subsequent post starts from a measured bottleneck. The rule of this series: add complexity only when measurements show it is necessary.
+
+## What You Have Now
+
+At the end of this post:
+
+- A profile and feed service with three endpoints
+- Prometheus metrics for request latency by route, database query time, and pool acquisition time
+- `pg_stat_statements` for query-level diagnosis
+- A k6 constant-arrival-rate load test that finds the breaking point under open-loop conditions
+- Connection pooling with `pgxpool` that eliminates single-connection serialization
+- Query batching that eliminates the N+1 problem
+
+The `v0.1.0` tag in `imrishuroy/scaling-reads` matches this state exactly. The next post adds indexes, not as an obvious fix, but as a careful examination of how the planner uses them, what they cost on writes, and when they help.
+
+**When not to use these techniques:** If your service handles fewer than 50 requests per second, a single connection may be sufficient. The added configuration of pooling is not worth it at low traffic. Query batching is not always faster than N individual primary-key lookups. An indexed lookup by primary key takes microseconds. Measure before you batch.
+
+**Key terms defined in this post:** p50/p95/p99, N+1 query, connection pool, query batching, open-loop load test, closed-loop load test, coordinated omission.

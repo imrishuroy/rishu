@@ -1,0 +1,635 @@
+---
+title: "Microservices Architecture Interview Questions: Beginner"
+date: "2026-11-16"
+tags: ["Microservices", "Go", "Distributed Systems", "Architecture"]
+summary: "What microservices are, how to draw service boundaries, and why the choice between monolith and microservices is an organizational decision as much as a technical one. With working Go examples and ASCII diagrams."
+readTime: 25
+draft: false
+---
+
+You can build a successful product with one Go binary, one database, and one deploy command. Many great products have been built exactly this way. This post is about why that approach eventually stops working, what you do about it, and how to answer the most common interview questions on the topic.
+
+This is Part 1 of a 3-part series. It covers the foundations: what microservices are, how to decide where service boundaries go, and what trade-offs you are actually making when you choose one architecture over the other.
+
+## Before You Start
+
+This section covers four concepts you need to understand before the rest of the post makes sense. If you already know these, skip ahead.
+
+### 1. HTTP: How Services Communicate
+
+An HTTP server listens on a port and responds to requests. Here is the smallest possible Go HTTP server:
+
+```go title="server.go"
+package main
+
+import (
+    "fmt"
+    "net/http"
+)
+
+func main() {
+    http.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
+        fmt.Fprintln(w, "hello")
+    })
+    http.ListenAndServe(":8080", nil)
+}
+```
+
+Another program can call this server:
+
+```go title="client.go"
+package main
+
+import (
+    "fmt"
+    "io"
+    "net/http"
+)
+
+func main() {
+    resp, err := http.Get("http://localhost:8080/hello")
+    if err != nil {
+        panic(err)
+    }
+    defer resp.Body.Close()
+    body, _ := io.ReadAll(resp.Body)
+    fmt.Println(string(body)) // prints: hello
+}
+```
+
+This is the basic mechanism microservices use to talk to each other. One service is the server, another is the client. They communicate over the network using HTTP.
+
+### 2. What a Database Is
+
+A database is a program that stores data so it survives when your application restarts. Your Go service writes data to the database and reads it back later. The database lives separately from your service: it is its own process, often on its own machine.
+
+In a monolith, every part of the application shares one database. In microservices, each service has its own database that nothing else touches directly.
+
+### 3. What a Process Is
+
+When you compile and run a Go program, the operating system gives it a process: a chunk of memory, a CPU time slice, and a port it can listen on.
+
+```bash
+go build -o user-service .
+./user-service   # starts one process on port 8080
+```
+
+A monolith is one process. A microservices system is many processes, each one a separate binary, potentially on separate machines. When one process crashes, the others keep running.
+
+### 4. Network Calls Can Fail
+
+Calling another service over HTTP is fundamentally different from calling a function in the same program. A function call never times out. An HTTP call can fail in dozens of ways: the network drops, the server is overloaded, the cable is unplugged.
+
+Always set a timeout on every HTTP call you make:
+
+```go title="safe_client.go"
+package main
+
+import (
+    "net/http"
+    "time"
+)
+
+func main() {
+    client := &http.Client{Timeout: 2 * time.Second}
+
+    resp, err := client.Get("http://user-service/users/42")
+    if err != nil {
+        // This happens more often than you think in production.
+        // Handle it, do not panic.
+        return
+    }
+    defer resp.Body.Close()
+}
+```
+
+Without a timeout, your program can hang indefinitely waiting for a response that never comes.
+
+---
+
+## Monolith vs Microservices
+
+### Q1. What is a monolith, and what are microservices?
+
+A **monolith** is one deployable unit: one codebase, one process, one database. Everything ships together.
+
+```go title="monolith/main.go"
+package main
+
+import (
+    "fmt"
+    "net/http"
+)
+
+func main() {
+    // All handlers in one binary, one process, one database connection.
+    http.HandleFunc("/users", handleUsers)
+    http.HandleFunc("/orders", handleOrders)
+    http.HandleFunc("/email", handleEmail)
+    http.ListenAndServe(":8080", nil)
+}
+
+func handleUsers(w http.ResponseWriter, r *http.Request)  { fmt.Fprintln(w, "users") }
+func handleOrders(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "orders") }
+func handleEmail(w http.ResponseWriter, r *http.Request)  { fmt.Fprintln(w, "email") }
+```
+
+A **microservices** architecture splits this into many small services. Each service is its own binary, runs in its own process, and owns its own database. They talk to each other over the network.
+
+```go title="user-service/main.go"
+package main
+
+import (
+    "fmt"
+    "net/http"
+)
+
+func main() {
+    http.HandleFunc("/users", handleUsers)
+    http.ListenAndServe(":8080", nil)
+}
+
+func handleUsers(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "users") }
+```
+
+```go title="order-service/main.go"
+package main
+
+import (
+    "fmt"
+    "net/http"
+)
+
+func main() {
+    http.HandleFunc("/orders", handleOrders)
+    http.ListenAndServe(":8081", nil)
+}
+
+func handleOrders(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "orders") }
+```
+
+```go title="email-service/main.go"
+package main
+
+import (
+    "fmt"
+    "net/http"
+)
+
+func main() {
+    http.HandleFunc("/email", handleEmail)
+    http.ListenAndServe(":8082", nil)
+}
+
+func handleEmail(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "email") }
+```
+
+Visually:
+
+```
+Monolith:                          Microservices:
++---------------------------+      +---------+  +---------+  +---------+
+| /users  /orders  /email   |      |  Users  |  | Orders  |  |  Email  |
+| one binary, one DB        |      +---------+  +---------+  +---------+
++---------------------------+          |             |             |
+            |                          v             v             v
+        [one_db]                  [users_db]   [orders_db]  [email_log]
+```
+
+### Q2. How do monolith and microservices compare?
+
+| Aspect | Monolith | Microservices |
+|--------|----------|---------------|
+| Deploy | One unit, everything at once | Many independent units |
+| Scaling | Scale the whole app | Scale each service independently |
+| Database | One shared database | One database per service |
+| Team coupling | High: everyone touches the same codebase | Low: teams own separate services |
+| Local dev | Easy: run one binary | Harder: need to run or mock multiple services |
+| Ops complexity | Low | High: containers, orchestration, service discovery |
+| Failure mode | One crash takes everything down | Partial degradation; healthy services stay up |
+| Refactoring | Compiler catches cross-module errors | Versioned APIs across service boundaries |
+
+A monolith is faster to start and easier to operate. Microservices pay off at scale, specifically at the scale of team size and traffic.
+
+### Q3. When should you choose a monolith?
+
+Choose a monolith when:
+
+- The team is small (under 20 engineers).
+- The product is still finding fit: requirements change every few weeks.
+- You do not have operations expertise (Kubernetes, container registries, service meshes).
+- Throughput is modest: a few hundred requests per second is nothing a single Go binary cannot handle.
+
+A well-structured monolith, often called a **modular monolith**, covers most needs for years. It is not a step backward. It is the right tool when the alternative is unnecessary complexity.
+
+### Q4. When should you choose microservices?
+
+Choose microservices when:
+
+- Multiple teams need to deploy independently without blocking each other.
+- Different parts of the system have wildly different scaling requirements. For example, your search service needs 50 servers at peak, but your billing service needs two.
+- Different parts have different reliability requirements. Payment processing needs five nines. The recommendation engine can tolerate occasional downtime.
+- The codebase has grown large enough that a single deploy is risky and slow.
+
+Microservices solve organizational problems and scaling problems. They do not make a poorly designed system better.
+
+### Q5. What is a distributed monolith, and why is it bad?
+
+A distributed monolith is a system that uses microservices architecture but has not achieved the independence that makes microservices worthwhile. The services are deployed separately but must be deployed together, share a database, or call each other synchronously in tight chains.
+
+```
+Distributed Monolith (the worst of both worlds):
+
++------------------+          +------------------+
+|   User Service   |          |  Order Service   |
++------------------+          +------------------+
+         |                             |
+         +--------+   +----------------+
+                  |   |
+              [shared_db]      <-- shared database: schema changes in one
+                                   service break the other
+```
+
+Tell-tale signs:
+
+- Service A cannot deploy without deploying Service B first.
+- Two services read from or write to the same database table.
+- A single user request fans out into ten synchronous calls that must all succeed.
+- Engineers say "we have microservices" but every release requires a coordinated rollout.
+
+You get the operational complexity of microservices (containers, networking, service discovery) with the coupling of a monolith (shared release cycles, shared data). It is the worst possible outcome.
+
+The fix is to draw real service boundaries (each service owns its data, each can deploy alone) or to merge the coupled services back into a single service.
+
+---
+
+## Service Boundaries and Decomposition
+
+The hardest part of microservices is deciding where the boundaries go. This section covers the main technique for doing it correctly.
+
+### Q6. How do you decide where to draw service boundaries?
+
+The best technique comes from **Domain-Driven Design (DDD)**. The idea is to map your business domain and find **bounded contexts**: areas of the business with their own consistent language and rules. Each bounded context is a good candidate for a service.
+
+For an e-commerce platform, the bounded contexts look like this:
+
+```
++----------+  +-----------+  +---------+  +------+
+| Catalog  |  | Inventory |  | Pricing |  | Cart |
+| products |  | stock qty |  | rules   |  |      |
++----------+  +-----------+  +---------+  +------+
+
++--------+  +----------+  +----------+  +--------------+
+| Orders |  | Payments |  | Shipping |  | Notifications|
+|        |  |          |  | tracking |  | email, SMS   |
++--------+  +----------+  +----------+  +--------------+
+```
+
+Each box has different stakeholders, changes at a different rate, and handles different data. Catalog changes when the product team adds items. Payments changes when regulations require new payment methods. These two contexts can evolve and deploy independently.
+
+### Q7. What is a bounded context?
+
+A bounded context is a clear boundary inside which a domain model is internally consistent. The same word can mean different things in different contexts. The important thing is that each context owns its own definition and does not force that definition on others.
+
+Consider the word "Customer":
+
+```go title="sales/customer.go"
+package sales
+
+// In the Sales context, a Customer is a lead with contact info and a score.
+type Customer struct {
+    ID        string
+    Name      string
+    Email     string
+    LeadScore int
+}
+```
+
+```go title="billing/customer.go"
+package billing
+
+// In the Billing context, a Customer is an account with payment details.
+type Customer struct {
+    ID            string
+    AccountNumber string
+    PaymentMethod string
+    CreditLimit   int
+}
+```
+
+These are both called "Customer" but they carry completely different information because they serve different business purposes. If you force them into one struct to share across the whole system, neither context gets exactly what it needs and you create a coupling point that causes problems every time either context needs to change.
+
+Each service owns its own definition of the entities that matter to it.
+
+### Q8. What are aggregates, and why do they matter for service design?
+
+An **aggregate** is a cluster of objects that must change together in a single transaction. The **aggregate root** is the entry point that controls access to everything inside the aggregate and enforces its invariants (the rules that must always be true).
+
+An Order with its line items is a classic aggregate. A line item cannot exist without its order. The order is the root that controls them.
+
+```go title="orders/order.go"
+package orders
+
+import "fmt"
+
+type LineItem struct {
+    SKU      string
+    Quantity int
+    PriceCents int
+}
+
+// Order is the aggregate root. LineItems only exist as part of an Order.
+type Order struct {
+    ID         string
+    CustomerID string
+    Items      []LineItem
+    Status     string
+}
+
+// AddItem enforces the invariant: quantity must be positive.
+func (o *Order) AddItem(item LineItem) error {
+    if item.Quantity <= 0 {
+        return fmt.Errorf("quantity must be positive, got %d", item.Quantity)
+    }
+    o.Items = append(o.Items, item)
+    return nil
+}
+
+// Total computes the order total in cents.
+func (o *Order) Total() int {
+    total := 0
+    for _, item := range o.Items {
+        total += item.PriceCents * item.Quantity
+    }
+    return total
+}
+```
+
+Why do aggregates matter for service boundaries?
+
+An aggregate must change atomically: all changes inside it happen in one transaction or none of them do. Database transactions within a single service are straightforward. Cross-service transactions are extremely hard (more on that in Part 2). So the natural rule is: **if two things must change atomically, they belong inside the same service**.
+
+If you find yourself writing code that modifies an Order and an Inventory item in the same transaction, that is a signal they might belong in the same service, or that you need to rethink the design.
+
+### Q9. How granular should services be?
+
+A useful heuristic: a service should be small enough that one team can own it, but large enough that a typical business operation completes within it without reaching out to other services for every step.
+
+Two anti-patterns to avoid:
+
+**Nano-services**: one service per function. For example, a `calculate-discount` service that does one calculation and nothing else. The overhead of a network call, a deployment pipeline, and an on-call rotation for a single function is not justified. High network overhead, no clear ownership, and the blast radius of a network blip hits every discount calculation.
+
+**Mega-services**: one service for half the business domain. This becomes a monolith with extra steps. If your "Order Service" also handles payments, shipping, inventory, and notifications, it is not really an Order service.
+
+Aim for **one bounded context per service** as your starting point. Adjust when experience shows a context is too large for one team, or two contexts are so tightly coupled that keeping them separate creates more friction than splitting them saves.
+
+### Q10. How do you migrate from a monolith to microservices?
+
+The **strangler fig pattern**: route new traffic to a new service while the monolith continues to handle the rest. Over time, you carve out more and more functionality until the monolith handles nothing and can be retired.
+
+```
+Step 1: Everything is in the monolith
+
+    [Clients] ---------> [Monolith: Users + Orders + Payments + Email]
+
+
+Step 2: Extract one bounded context, add a gateway to route traffic
+
+    [Clients] --> [Gateway] --> [Monolith: Orders + Payments + Email]
+                           |
+                           +--> [User Service]  <-- new, extracted service
+
+
+Step 3: Extract more contexts; eventually retire the monolith
+
+    [Clients] --> [Gateway] --> [User Service]
+                           +--> [Order Service]
+                           +--> [Payment Service]
+                           +--> [Email Service]
+```
+
+The key rule: **the monolith keeps shipping while you migrate**. A big-bang rewrite, where you stop all feature development and rewrite everything from scratch, almost always fails. The monolith changes underneath you while you are rewriting it, timelines slip, and teams lose confidence. The strangler fig lets you migrate incrementally, one bounded context at a time, with the old system as a safety net.
+
+---
+
+## How Services Talk to Each Other
+
+This section is a brief overview. Part 2 covers each option in depth with Go code and trade-off analysis.
+
+### Q11. What are the communication options between services?
+
+| Style | Examples | When to use |
+|-------|----------|-------------|
+| Synchronous request-reply | HTTP/REST, gRPC | Caller needs an answer right now |
+| Asynchronous messaging | Kafka, RabbitMQ, SQS | Fire-and-forget, or broadcast to many consumers |
+| Event-driven | Kafka topics, event bus | Something happened; let whoever cares react |
+| Streaming | gRPC streams, WebSocket | Continuous flow of data in both directions |
+
+A real system uses several of these. The important thing is to choose the right style for each interaction, not to pick one and use it everywhere.
+
+### Q12. When should you use synchronous communication versus asynchronous?
+
+| Synchronous (HTTP/gRPC) | Asynchronous (queue/events) |
+|-------------------------|-----------------------------|
+| Caller needs a result to continue | Caller can move on without waiting |
+| Strong consistency required | Eventual consistency is acceptable |
+| One caller, one receiver | Broadcast to many receivers |
+| Fast response expected | Long-running work |
+
+```go title="communication_styles.go"
+package example
+
+import (
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "time"
+)
+
+type User struct {
+    ID   string `json:"id"`
+    Name string `json:"name"`
+}
+
+// Synchronous: the order service calls user-service and waits for the result.
+// The caller is blocked until the response arrives.
+func getUserSync(userID string) (*User, error) {
+    client := &http.Client{Timeout: 2 * time.Second}
+    resp, err := client.Get(fmt.Sprintf("http://user-service/users/%s", userID))
+    if err != nil {
+        return nil, fmt.Errorf("get user: %w", err)
+    }
+    defer resp.Body.Close()
+
+    var user User
+    if err := json.NewDecoder(resp.Body).Decode(&user); err != nil {
+        return nil, fmt.Errorf("decode user: %w", err)
+    }
+    return &user, nil
+}
+
+// Asynchronous: publish an event and return immediately.
+// The caller does not wait. Other services react when they are ready.
+func publishOrderCreated(orderID string, customerID string) {
+    // In a real system, this would publish to Kafka, RabbitMQ, etc.
+    // For illustration: writing to a channel represents handing off to a broker.
+    event := map[string]string{
+        "type":        "order.created",
+        "order_id":    orderID,
+        "customer_id": customerID,
+    }
+    _ = event // broker.Publish("order.created", event)
+}
+```
+
+Default to asynchronous wherever you do not need an immediate answer. Synchronous calls couple services in time: if the downstream service is slow, the caller is slow. If the downstream service is down, the caller fails. Asynchronous communication decouples their lifecycles.
+
+---
+
+## How to Get Better at This
+
+### Build It
+
+The best way to understand the difference between a monolith and microservices is to build both. Here is a minimal two-service Go application you can run on your laptop in under ten minutes.
+
+**Step 1.** Create two directories and initialize Go modules:
+
+```bash
+mkdir user-service order-service
+cd user-service && go mod init user-service && cd ..
+cd order-service && go mod init order-service && cd ..
+```
+
+**Step 2.** Write the user service:
+
+```go title="user-service/main.go"
+package main
+
+import (
+    "encoding/json"
+    "net/http"
+    "strings"
+)
+
+type User struct {
+    ID   string `json:"id"`
+    Name string `json:"name"`
+    Role string `json:"role"`
+}
+
+var users = map[string]User{
+    "usr-1": {ID: "usr-1", Name: "Rishu Kumar", Role: "engineer"},
+    "usr-2": {ID: "usr-2", Name: "Priya Singh", Role: "designer"},
+}
+
+func main() {
+    http.HandleFunc("/users/", func(w http.ResponseWriter, r *http.Request) {
+        id := strings.TrimPrefix(r.URL.Path, "/users/")
+        user, ok := users[id]
+        if !ok {
+            http.Error(w, "user not found", http.StatusNotFound)
+            return
+        }
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(user)
+    })
+    http.ListenAndServe(":8080", nil)
+}
+```
+
+**Step 3.** Write the order service, which calls the user service:
+
+```go title="order-service/main.go"
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "strings"
+    "time"
+)
+
+type User struct {
+    ID   string `json:"id"`
+    Name string `json:"name"`
+    Role string `json:"role"`
+}
+
+type Order struct {
+    ID       string  `json:"id"`
+    UserID   string  `json:"user_id"`
+    Item     string  `json:"item"`
+    Quantity int     `json:"quantity"`
+    User     *User   `json:"user,omitempty"`
+}
+
+var orders = map[string]Order{
+    "ord-1": {ID: "ord-1", UserID: "usr-1", Item: "keyboard", Quantity: 1},
+    "ord-2": {ID: "ord-2", UserID: "usr-2", Item: "monitor", Quantity: 2},
+}
+
+var userClient = &http.Client{Timeout: 2 * time.Second}
+
+func main() {
+    http.HandleFunc("/orders/", func(w http.ResponseWriter, r *http.Request) {
+        id := strings.TrimPrefix(r.URL.Path, "/orders/")
+        order, ok := orders[id]
+        if !ok {
+            http.Error(w, "order not found", http.StatusNotFound)
+            return
+        }
+
+        // Call the user service to enrich the order with user details.
+        resp, err := userClient.Get(fmt.Sprintf("http://localhost:8080/users/%s", order.UserID))
+        if err == nil && resp.StatusCode == http.StatusOK {
+            defer resp.Body.Close()
+            var user User
+            if json.NewDecoder(resp.Body).Decode(&user) == nil {
+                order.User = &user
+            }
+        }
+
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(order)
+    })
+    http.ListenAndServe(":8081", nil)
+}
+```
+
+**Step 4.** Run both services in separate terminals:
+
+```bash
+# terminal 1
+cd user-service && go run main.go
+
+# terminal 2
+cd order-service && go run main.go
+
+# terminal 3: test it
+curl http://localhost:8081/orders/ord-1
+```
+
+You will see the order response include the user's details fetched live from the user service. Try stopping the user service and calling the order service again. Notice that the order response still comes back, just without the user details. That is **partial degradation**: one service failing does not bring down everything else.
+
+### Read
+
+- **"Building Microservices" by Sam Newman (2nd edition)** is the standard reference. The first three chapters cover service boundaries and decomposition in depth.
+- **"What is Domain-Driven Design" on martinfowler.com** (free) explains bounded contexts, aggregates, and ubiquitous language in plain language.
+
+### Practice
+
+Draw a bounded context diagram for a food delivery app. The app has riders, restaurants, customers, orders, payments, and notifications. For each of the following, ask: does this context have its own definition of "Order"?
+
+- The rider app shows the order as a delivery with a pickup address and a drop address.
+- The restaurant sees the order as a list of items to prepare.
+- The customer sees the order as a receipt with a price and a status.
+- The payment system sees the order as a charge amount and a payment method.
+
+That is four different definitions of the same word. Each one belongs in a different bounded context. Each bounded context is a candidate for a separate service.
+
+---
+
+## Next in This Series
+
+[Microservices Architecture Interview Questions: Intermediate](/blogs/ms-architecture-interview-02-intermediate) covers communication patterns in depth (REST vs gRPC), resilience patterns (circuit breakers, retries, rate limiting), sagas for distributed workflows, the transactional outbox pattern, and idempotency.
