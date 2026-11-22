@@ -118,6 +118,10 @@ h2 - Section headings (Work Experience, Skills, Projects, Blog)
 h3 - Card headings within sections (AlgoPatterns, company names, post titles)
 ```
 
+## Git
+
+Do not run any git commands. The user manages all git operations — commits, staging, branches, pushes. Never run `git add`, `git commit`, `git push`, `git reset`, or any other git command unless the user explicitly asks for it in that message.
+
 ## What not to change without asking
 
 - The color tokens in `tailwind.config.ts` form the full design system. Do not swap to arbitrary hex values in components.

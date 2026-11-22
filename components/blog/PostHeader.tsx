@@ -1,6 +1,7 @@
 import Link from 'next/link'
 import { formatDate } from '@/lib/utils'
 import type { PostMeta } from '@/lib/posts'
+import SeriesBadge from '@/components/blog/SeriesBadge'
 
 interface PostHeaderProps {
   post: PostMeta
@@ -11,12 +12,19 @@ export default function PostHeader({ post }: PostHeaderProps) {
     <header className="space-y-6 pb-8 border-b border-outline-variant/30">
       {/* Back link */}
       <Link
-        href="/blogs"
+        href={post.series ? `/blogs/${post.series}` : '/blogs'}
         className="inline-flex items-center gap-1.5 text-on-surface-variant hover:text-primary text-label-sm transition-colors"
       >
         <span className="material-symbols-outlined text-sm">arrow_back</span>
-        <span>All posts</span>
+        <span>{post.series ? 'Back to series' : 'All posts'}</span>
       </Link>
+
+      {/* Series badge */}
+      {post.series && (
+        <div>
+          <SeriesBadge series={post.series} order={post.seriesOrder} />
+        </div>
+      )}
 
       {/* Tags */}
       <div className="flex flex-wrap gap-2">

@@ -1,0 +1,1372 @@
+---
+title: "Microservices Architecture Interview Questions: Intermediate"
+date: "2026-11-17"
+tags: ["Microservices", "Go", "gRPC", "Kafka", "Resilience", "Distributed Systems"]
+summary: "Circuit breakers, retries, sagas, the transactional outbox, and idempotency keys. Everything about inter-service communication and data consistency that trips up engineers moving from monolith to microservices. With working Go examples."
+readTime: 35
+draft: false
+---
+
+> **Prerequisite:** This post assumes you know the material in [Microservices Architecture Interview Questions: Beginner](/blogs/ms-architecture-interview-01-beginner). Read that first if you are new to microservices.
+
+The beginner post covered what microservices are and where to draw the boundaries. This post covers how they communicate reliably, what to do when they fail, how to keep data consistent across services, and how to make operations safe to retry. These are the topics that trip up most engineers when they first work at scale.
+
+## Before You Start
+
+Three concepts you need before the rest of this post makes sense.
+
+### 1. Go Goroutines and Channels
+
+A goroutine is a lightweight thread managed by the Go runtime. You launch one with `go`:
+
+```go title="goroutines.go"
+package main
+
+import (
+    "fmt"
+    "sync"
+)
+
+func main() {
+    var wg sync.WaitGroup
+
+    for i := 0; i < 3; i++ {
+        wg.Add(1)
+        go func(id int) {
+            defer wg.Done()
+            fmt.Printf("worker %d running\n", id)
+        }(i)
+    }
+
+    wg.Wait()
+    fmt.Println("all workers done")
+}
+```
+
+A channel is a typed pipe between goroutines:
+
+```go title="channels.go"
+package main
+
+import "fmt"
+
+func main() {
+    ch := make(chan string, 2) // buffered: holds up to 2 messages without blocking
+
+    ch <- "first"
+    ch <- "second"
+
+    fmt.Println(<-ch) // first
+    fmt.Println(<-ch) // second
+}
+```
+
+This matters because the **bulkhead pattern** uses buffered channels to limit concurrency per downstream service.
+
+### 2. What a Message Broker Is
+
+A message broker (Kafka, RabbitMQ, SQS) is a middleman that stores messages from producers and delivers them to consumers. Think of it like a postal system: the sender drops a letter in the mailbox and walks away. The post office delivers it when it can. The sender does not wait.
+
+```
+Producer             Broker             Consumer
+[Order Service] ---> [Kafka topic] ---> [Email Service]
+                                   ---> [Analytics Service]
+                                   ---> [Inventory Service]
+```
+
+The producer does not know who consumes. Adding a new consumer does not require changing the producer.
+
+### 3. SQL Transactions
+
+A transaction is a unit of work that either completes fully or not at all. This is critical for understanding the outbox pattern later.
+
+```go title="transaction.go"
+package main
+
+import (
+    "context"
+    "database/sql"
+    "fmt"
+)
+
+func transferMoney(ctx context.Context, db *sql.DB, fromID, toID string, cents int) error {
+    tx, err := db.BeginTx(ctx, nil)
+    if err != nil {
+        return fmt.Errorf("begin: %w", err)
+    }
+    defer tx.Rollback() // no-op if Commit() was already called
+
+    if _, err = tx.ExecContext(ctx,
+        `UPDATE accounts SET balance = balance - $1 WHERE id = $2`,
+        cents, fromID,
+    ); err != nil {
+        return fmt.Errorf("debit: %w", err)
+    }
+
+    if _, err = tx.ExecContext(ctx,
+        `UPDATE accounts SET balance = balance + $1 WHERE id = $2`,
+        cents, toID,
+    ); err != nil {
+        return fmt.Errorf("credit: %w", err)
+    }
+
+    return tx.Commit()
+}
+```
+
+If the credit fails, the debit is rolled back. Both writes happen, or neither does.
+
+---
+
+## Communication Patterns
+
+### Q13. REST vs gRPC: which should you use between services?
+
+REST uses HTTP with JSON. gRPC uses HTTP/2 with Protocol Buffers (protobuf), a compact binary format.
+
+| | REST / JSON | gRPC |
+|---|---|---|
+| Wire format | Text JSON | Binary protobuf |
+| Schema | OpenAPI (optional) | Proto file (required) |
+| Performance | Acceptable | Faster binary serialization |
+| Browser support | Native | Needs gRPC-Web proxy |
+| Streaming | Server-Sent Events only | Native bidirectional streaming |
+| Tooling for humans | curl, Postman, browser | grpcurl, Buf Studio |
+| Code generation | Optional | Built-in from .proto |
+
+**Use gRPC** for service-to-service communication where both sides are under your control and performance matters. The .proto file acts as a strongly typed contract that is enforced at compile time.
+
+**Use REST** for public-facing APIs and browser clients. JSON is universally supported and easy to debug.
+
+Here is a minimal gRPC service definition and its Go server:
+
+```protobuf title="orders.proto"
+syntax = "proto3";
+package orders;
+option go_package = "example.com/orders/gen";
+
+service OrderService {
+  rpc CreateOrder(CreateOrderRequest) returns (OrderResponse);
+  rpc GetOrder(GetOrderRequest)       returns (OrderResponse);
+}
+
+message CreateOrderRequest {
+  string customer_id = 1;
+  repeated OrderItem items = 2;
+}
+
+message OrderItem {
+  string sku      = 1;
+  int32  quantity = 2;
+}
+
+message OrderResponse {
+  string id     = 1;
+  string status = 2;
+}
+
+message GetOrderRequest {
+  string id = 1;
+}
+```
+
+```go title="order-grpc-server.go"
+package main
+
+import (
+    "context"
+    "fmt"
+    "net"
+
+    "google.golang.org/grpc"
+    pb "example.com/orders/gen"
+)
+
+type orderServer struct {
+    pb.UnimplementedOrderServiceServer
+}
+
+func (s *orderServer) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (*pb.OrderResponse, error) {
+    // Validate, persist, publish event in a real server.
+    return &pb.OrderResponse{
+        Id:     "ord-123",
+        Status: "created",
+    }, nil
+}
+
+func (s *orderServer) GetOrder(ctx context.Context, req *pb.GetOrderRequest) (*pb.OrderResponse, error) {
+    return &pb.OrderResponse{Id: req.Id, Status: "shipped"}, nil
+}
+
+func main() {
+    lis, err := net.Listen("tcp", ":9090")
+    if err != nil {
+        panic(fmt.Sprintf("listen: %v", err))
+    }
+    s := grpc.NewServer()
+    pb.RegisterOrderServiceServer(s, &orderServer{})
+    if err := s.Serve(lis); err != nil {
+        panic(err)
+    }
+}
+```
+
+Generate the Go code from the proto file with:
+
+```bash
+protoc --go_out=gen --go-grpc_out=gen orders.proto
+```
+
+### Q14. What is GraphQL Federation?
+
+GraphQL Federation lets multiple services each own a part of a single GraphQL schema. A gateway stitches them at query time. The client queries `user.orders` as if it were one graph; the gateway asks the user service for the user and the order service for the orders.
+
+```graphql
+# In the users service schema
+type User @key(fields: "id") {
+  id:   ID!
+  name: String!
+}
+
+# In the orders service schema: extends User with an orders field
+extend type User @key(fields: "id") {
+  id:     ID! @external
+  orders: [Order!]!
+}
+```
+
+This is useful when you have many teams each owning part of the graph and you do not want one monolithic GraphQL schema to become a coordination bottleneck.
+
+---
+
+## API Gateway and BFF
+
+### Q15. What is an API gateway?
+
+An API gateway sits in front of all your services as a single entry point. It handles cross-cutting concerns so each service does not have to:
+
+- TLS termination
+- Authentication and authorization
+- Rate limiting
+- Request routing
+- Request and response transformation
+- Observability (access logging, tracing headers)
+
+```
+[Mobile app]  \
+[Web app]      --> [Gateway] --> [User Service]
+[Partner API] /               --> [Order Service]
+                              --> [Payment Service]
+```
+
+Without a gateway, every service reimplements auth and rate limiting. With a gateway, services can focus on business logic.
+
+### Q16. What is the Backend for Frontend (BFF) pattern?
+
+BFF creates a separate gateway per client type. Each BFF is optimized for one client's needs:
+
+```
+[iOS App]       --> [iOS BFF]       --> backend services
+[Web App]       --> [Web BFF]       --> backend services
+[Partner API]   --> [Partner BFF]   --> backend services
+```
+
+```go title="bff_example.go"
+package main
+
+import (
+    "encoding/json"
+    "net/http"
+)
+
+// mobileOrderResponse returns compact data optimized for mobile screens.
+type mobileOrderResponse struct {
+    ID     string `json:"id"`
+    Status string `json:"status"`
+    Total  int    `json:"total_cents"`
+}
+
+// webOrderResponse returns richer data for desktop.
+type webOrderResponse struct {
+    ID           string       `json:"id"`
+    Status       string       `json:"status"`
+    Total        int          `json:"total_cents"`
+    Items        []orderItem  `json:"items"`
+    CustomerName string       `json:"customer_name"`
+    CreatedAt    string       `json:"created_at"`
+}
+
+type orderItem struct {
+    SKU      string `json:"sku"`
+    Quantity int    `json:"quantity"`
+}
+
+func mobileBFF(w http.ResponseWriter, r *http.Request) {
+    // Fetch from backend services, return compact mobile response.
+    resp := mobileOrderResponse{ID: "ord-1", Status: "shipped", Total: 4999}
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(resp)
+}
+
+func webBFF(w http.ResponseWriter, r *http.Request) {
+    // Fetch from backend services, return rich web response.
+    resp := webOrderResponse{
+        ID:           "ord-1",
+        Status:       "shipped",
+        Total:        4999,
+        Items:        []orderItem{{SKU: "KB-001", Quantity: 1}},
+        CustomerName: "Rishu Kumar",
+        CreatedAt:    "2026-11-17T10:00:00Z",
+    }
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(resp)
+}
+```
+
+Mobile gets a payload with three fields; the web gets a full view with line items and customer info. Neither forces the backend services to change their APIs.
+
+### Q17. Should you put business logic in the API gateway?
+
+No. The gateway is a smart pipe: routing, auth, rate limiting, logging. Business logic in the gateway couples the gateway to every service's domain and turns it into a deployment bottleneck. Business logic belongs in services.
+
+---
+
+## Service Discovery and Load Balancing
+
+### Q18. What is service discovery?
+
+Services scale up and down. Instances crash and restart with new IP addresses. Service discovery is how a caller finds the current healthy set of instances for a service.
+
+**Server-side discovery**: the caller sends requests to a load balancer, which knows the instances. This is how AWS ALB and Kubernetes Services work.
+
+**Client-side discovery**: the caller queries a registry (Consul, etcd) and picks an instance itself. More flexible but more complex.
+
+In Kubernetes, every Service gets a stable DNS name:
+
+```go title="k8s_service_call.go"
+package main
+
+import (
+    "net/http"
+    "time"
+)
+
+func main() {
+    client := &http.Client{Timeout: 2 * time.Second}
+
+    // "user-service" resolves to the Kubernetes Service's ClusterIP,
+    // which load-balances across healthy pods automatically.
+    resp, err := client.Get("http://user-service/users/42")
+    if err != nil {
+        return
+    }
+    defer resp.Body.Close()
+}
+```
+
+You do not need to manage IP addresses or implement health-check logic. Kubernetes handles it.
+
+### Q19. L4 vs L7 load balancing?
+
+**L4 (transport layer)**: routes by IP address and TCP port. Fast, simple, does not look at the HTTP content.
+
+**L7 (application layer)**: inspects HTTP headers, path, cookies. Can route based on path (`/api/v2/*` to new service), inject headers, retry on 5xx responses.
+
+Use L7 for service-to-service routing where you care about request content. Use L4 for raw TCP traffic or when you need maximum throughput with minimal latency overhead.
+
+### Q20. When do you use client-side load balancing?
+
+When you want to avoid an extra network hop and want sophisticated strategies: round-robin, least-connections, or outlier detection (stop sending to slow instances). gRPC uses client-side load balancing by default. Service meshes like Istio and Linkerd implement it at the sidecar proxy layer, so application code does not need to know about it.
+
+---
+
+## Resilience Patterns
+
+Networks fail. Services slow down. These patterns prevent one misbehaving service from taking down everything else.
+
+### Q21. What is the circuit breaker pattern?
+
+When a downstream service is failing, do not keep sending requests to it. A circuit breaker counts failures. After a threshold is crossed, it "opens" and subsequent calls fail immediately without hitting the broken service. After a cooldown, it moves to "half-open" and tries one test request. If that succeeds, it closes again.
+
+```
+[CLOSED] --(failures >= threshold)--> [OPEN]
+                                          |
+                                    (cooldown elapsed)
+                                          v
+                                     [HALF-OPEN]
+                                     /           \
+                            (success)             (failure)
+                                v                      v
+                            [CLOSED]               [OPEN]
+```
+
+```go title="circuit_breaker.go"
+package circuitbreaker
+
+import (
+    "errors"
+    "sync"
+    "time"
+)
+
+type state int
+
+const (
+    stateClosed   state = iota
+    stateOpen
+    stateHalfOpen
+)
+
+// ErrOpen is returned when the circuit is open and the call is rejected.
+var ErrOpen = errors.New("circuit breaker is open")
+
+type CircuitBreaker struct {
+    mu           sync.Mutex
+    state        state
+    failures     int
+    threshold    int
+    lastFailTime time.Time
+    cooldown     time.Duration
+}
+
+func New(threshold int, cooldown time.Duration) *CircuitBreaker {
+    return &CircuitBreaker{
+        state:     stateClosed,
+        threshold: threshold,
+        cooldown:  cooldown,
+    }
+}
+
+// Call executes fn if the circuit allows it.
+func (cb *CircuitBreaker) Call(fn func() error) error {
+    cb.mu.Lock()
+    defer cb.mu.Unlock()
+
+    switch cb.state {
+    case stateOpen:
+        if time.Since(cb.lastFailTime) < cb.cooldown {
+            return ErrOpen
+        }
+        cb.state = stateHalfOpen
+
+    case stateHalfOpen:
+        // Allow one test request through.
+    }
+
+    err := fn()
+    if err != nil {
+        cb.failures++
+        cb.lastFailTime = time.Now()
+        if cb.failures >= cb.threshold || cb.state == stateHalfOpen {
+            cb.state = stateOpen
+        }
+        return err
+    }
+
+    cb.failures = 0
+    cb.state = stateClosed
+    return nil
+}
+```
+
+Usage: wrap every call to a downstream service in a circuit breaker.
+
+```go title="payment_client.go"
+package main
+
+import (
+    "fmt"
+    "net/http"
+    "time"
+
+    "example.com/circuitbreaker"
+)
+
+var paymentBreaker = circuitbreaker.New(5, 10*time.Second)
+
+func chargePayment(orderID string, cents int) error {
+    return paymentBreaker.Call(func() error {
+        client := &http.Client{Timeout: 2 * time.Second}
+        resp, err := client.Post(
+            fmt.Sprintf("http://payment-service/charge/%s", orderID),
+            "application/json",
+            nil,
+        )
+        if err != nil {
+            return err
+        }
+        defer resp.Body.Close()
+        if resp.StatusCode >= 500 {
+            return fmt.Errorf("payment service error: %d", resp.StatusCode)
+        }
+        return nil
+    })
+}
+```
+
+After 5 failures, calls to the payment service fail immediately for 10 seconds instead of waiting for each one to time out. The service gets time to recover.
+
+### Q22. Why are timeouts critical?
+
+Without an explicit timeout, a network call can hang until the TCP connection times out, which can take minutes on some systems. During that time, the goroutine handling the original request is blocked. Enough blocked goroutines and your service stops responding.
+
+```go title="timeouts.go"
+package main
+
+import (
+    "context"
+    "net/http"
+    "time"
+)
+
+func callWithTimeout(url string) (*http.Response, error) {
+    ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+    defer cancel()
+
+    req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+    if err != nil {
+        return nil, err
+    }
+
+    return http.DefaultClient.Do(req)
+}
+```
+
+Rule: every HTTP call you make to another service must have a timeout shorter than your own service's timeout. If your service has a 5-second timeout, your outgoing calls should have a 2-second timeout, leaving headroom for retries.
+
+### Q23. What is retry, and what are the catches?
+
+A retry is calling an operation again when it fails transiently. The network dropped for a moment, the server had a GC pause, the load balancer briefly rejected the connection. These are all worth retrying.
+
+Three catches:
+
+1. **Retries amplify load during an outage.** If a service is overloaded and you retry every failed request, you triple the load. Use exponential backoff with jitter.
+2. **Retrying non-idempotent operations causes duplicates.** A `POST /orders` that fails halfway might have already created the order. Make operations idempotent before retrying them (covered in the Idempotency section).
+3. **Do not retry forever.** After `maxAttempts`, give up and return an error.
+
+```go title="retry.go"
+package retry
+
+import (
+    "context"
+    "fmt"
+    "math/rand"
+    "time"
+)
+
+// Do retries fn up to maxAttempts times with exponential backoff and jitter.
+func Do(ctx context.Context, maxAttempts int, fn func() error) error {
+    var lastErr error
+    for i := 0; i < maxAttempts; i++ {
+        lastErr = fn()
+        if lastErr == nil {
+            return nil
+        }
+
+        if i == maxAttempts-1 {
+            break
+        }
+
+        base := time.Duration(1<<uint(i)) * 100 * time.Millisecond
+        jitter := time.Duration(rand.Intn(100)) * time.Millisecond
+        wait := base + jitter
+        if wait > 5*time.Second {
+            wait = 5 * time.Second
+        }
+
+        select {
+        case <-ctx.Done():
+            return fmt.Errorf("context cancelled after %d attempts: %w", i+1, ctx.Err())
+        case <-time.After(wait):
+        }
+    }
+    return fmt.Errorf("after %d attempts: %w", maxAttempts, lastErr)
+}
+```
+
+Backoff schedule with jitter (attempt 0: ~100ms, 1: ~200ms, 2: ~400ms, capped at 5s). The random jitter prevents all retrying clients from hitting the recovering service at the same moment.
+
+### Q24. What is the bulkhead pattern?
+
+Named after the watertight compartments in a ship: if one compartment floods, the others stay dry. In services, isolate resources per downstream dependency so a slowdown in one does not starve all callers.
+
+```go title="bulkhead.go"
+package bulkhead
+
+import (
+    "context"
+    "fmt"
+)
+
+// Bulkhead limits the number of concurrent calls to a downstream service.
+type Bulkhead struct {
+    sem chan struct{}
+}
+
+func New(maxConcurrent int) *Bulkhead {
+    return &Bulkhead{sem: make(chan struct{}, maxConcurrent)}
+}
+
+// Do runs fn if a slot is available. If all slots are taken, it waits for
+// ctx to be done and returns an error.
+func (b *Bulkhead) Do(ctx context.Context, fn func() error) error {
+    select {
+    case b.sem <- struct{}{}:
+        defer func() { <-b.sem }()
+        return fn()
+    case <-ctx.Done():
+        return fmt.Errorf("bulkhead: %w", ctx.Err())
+    }
+}
+```
+
+```go title="bulkhead_usage.go"
+package main
+
+import (
+    "context"
+    "example.com/bulkhead"
+)
+
+// Separate bulkheads per downstream service.
+// Slow calls to payments cannot consume all slots for inventory.
+var (
+    paymentBulkhead   = bulkhead.New(10) // at most 10 concurrent payment calls
+    inventoryBulkhead = bulkhead.New(20) // at most 20 concurrent inventory calls
+)
+
+func chargePayment(ctx context.Context, orderID string) error {
+    return paymentBulkhead.Do(ctx, func() error {
+        // actual HTTP call
+        return nil
+    })
+}
+
+func checkInventory(ctx context.Context, sku string) error {
+    return inventoryBulkhead.Do(ctx, func() error {
+        // actual HTTP call
+        return nil
+    })
+}
+```
+
+If the payment service slows down and all 10 payment slots fill up, inventory calls are unaffected. The 20 inventory slots are still available.
+
+### Q25. What is a fallback?
+
+When a service fails, return something useful instead of returning an error.
+
+```go title="recommendations.go"
+package main
+
+import (
+    "context"
+    "log"
+)
+
+type Product struct {
+    ID   string
+    Name string
+}
+
+type MLService interface {
+    Recommend(ctx context.Context, userID string) ([]Product, error)
+}
+
+func getRecommendations(ctx context.Context, mlService MLService, userID string) []Product {
+    products, err := mlService.Recommend(ctx, userID)
+    if err != nil {
+        log.Printf("recommendation service unavailable: %v, using defaults", err)
+        return defaultPopularProducts()
+    }
+    return products
+}
+
+func defaultPopularProducts() []Product {
+    return []Product{
+        {ID: "prod-1", Name: "Go Programming Language"},
+        {ID: "prod-2", Name: "Designing Data-Intensive Applications"},
+    }
+}
+```
+
+A page that shows popular items is better than a page that shows an error. Only use fallbacks where a degraded result is genuinely acceptable. For payment processing, there is no acceptable fallback.
+
+### Q26. What is rate limiting, and where do you apply it?
+
+Rate limiting caps the number of requests a client can make in a time window. Apply it at multiple layers:
+
+- **Edge / CDN**: absorb floods before they reach your servers.
+- **API gateway**: per API key or per IP.
+- **Individual service**: defend against internal callers misbehaving.
+- **Per user**: prevent one user from monopolizing a shared resource.
+
+The token bucket algorithm: a bucket holds up to `capacity` tokens and refills at `rate` tokens per second. Each request consumes one token. No tokens: reject.
+
+```go title="rate_limiter.go"
+package ratelimit
+
+import (
+    "sync"
+    "time"
+)
+
+// TokenBucket implements a token bucket rate limiter.
+type TokenBucket struct {
+    mu       sync.Mutex
+    tokens   float64
+    capacity float64
+    rate     float64 // tokens per second
+    lastFill time.Time
+}
+
+func New(capacity float64, ratePerSec float64) *TokenBucket {
+    return &TokenBucket{
+        tokens:   capacity,
+        capacity: capacity,
+        rate:     ratePerSec,
+        lastFill: time.Now(),
+    }
+}
+
+// Allow returns true if the request is permitted.
+func (tb *TokenBucket) Allow() bool {
+    tb.mu.Lock()
+    defer tb.mu.Unlock()
+
+    now := time.Now()
+    elapsed := now.Sub(tb.lastFill).Seconds()
+    tb.lastFill = now
+
+    tb.tokens += elapsed * tb.rate
+    if tb.tokens > tb.capacity {
+        tb.tokens = tb.capacity
+    }
+
+    if tb.tokens < 1 {
+        return false
+    }
+    tb.tokens--
+    return true
+}
+```
+
+```go title="rate_limit_middleware.go"
+package main
+
+import (
+    "net/http"
+    "example.com/ratelimit"
+)
+
+var limiter = ratelimit.New(100, 10) // burst 100, 10 req/sec sustained
+
+func RateLimitMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if !limiter.Allow() {
+            http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+            return
+        }
+        next.ServeHTTP(w, r)
+    })
+}
+```
+
+---
+
+## Sagas and Distributed Workflows
+
+### Q27. Why can you not use two-phase commit across microservices?
+
+Two-phase commit (2PC) coordinates a transaction across multiple participants: all vote "ready," then all commit together. It requires:
+
+- A coordinator that cannot fail.
+- All participants to hold locks until the coordinator says "commit."
+- All participants to be available simultaneously.
+
+In a microservices system, a downstream service might be unavailable for minutes during a deploy or a network partition. Holding database locks for minutes kills throughput. 2PC is impractical for cross-service business workflows.
+
+The practical alternative is sagas.
+
+### Q28. What is a saga?
+
+A saga is a sequence of local transactions, one per service, where each step has a compensating transaction that undoes it if a later step fails.
+
+```
+Place order saga:
+  Step 1: Reserve inventory     Compensation: Release inventory reservation
+  Step 2: Charge payment        Compensation: Refund the charge
+  Step 3: Create shipment       Compensation: Cancel the shipment
+
+If step 3 fails:
+  Run compensation for step 2: refund
+  Run compensation for step 1: release inventory reservation
+```
+
+Each step is a local transaction in one service's database. No distributed lock is held. If something fails, compensations run in reverse order.
+
+### Q29. Orchestration vs choreography sagas?
+
+**Orchestration**: a central orchestrator calls each service in sequence and handles compensations if anything fails.
+
+**Choreography**: each service publishes an event when its step completes; other services react to events and execute their own steps.
+
+```
+Orchestration:
+[Orchestrator] --> calls Inventory: reserve
+                   on success --> calls Payment: charge
+                   on success --> calls Shipping: create
+                   on failure --> calls Payment: refund
+                              --> calls Inventory: release
+
+Choreography:
+[Order Service]    publishes "order.created"
+[Inventory Svc]    hears "order.created" --> reserves stock --> publishes "stock.reserved"
+[Payment Svc]      hears "stock.reserved" --> charges card --> publishes "payment.charged"
+[Shipping Svc]     hears "payment.charged" --> creates shipment --> publishes "shipment.created"
+```
+
+| | Orchestration | Choreography |
+|---|---|---|
+| Logic location | Central, one place to read | Spread across services |
+| Coupling | Orchestrator knows all services | Services know events, not each other |
+| Visibility | Easy to trace one flow | Needs distributed tracing |
+| Evolution | Change orchestrator | Change publish and subscribe |
+
+Here is a Go orchestrator:
+
+```go title="order_orchestrator.go"
+package orchestrator
+
+import (
+    "context"
+    "fmt"
+)
+
+type Order struct {
+    ID         string
+    CustomerID string
+    Items      []OrderItem
+    TotalCents int
+    Address    string
+}
+
+type OrderItem struct {
+    SKU      string
+    Quantity int
+}
+
+type InventoryService interface {
+    Reserve(ctx context.Context, orderID string, items []OrderItem) error
+    Release(ctx context.Context, orderID string) error
+}
+
+type PaymentService interface {
+    Charge(ctx context.Context, orderID string, cents int) error
+    Refund(ctx context.Context, orderID string) error
+}
+
+type ShippingService interface {
+    CreateShipment(ctx context.Context, orderID, address string) error
+    CancelShipment(ctx context.Context, orderID string) error
+}
+
+type Orchestrator struct {
+    inventory InventoryService
+    payments  PaymentService
+    shipping  ShippingService
+}
+
+func New(inv InventoryService, pay PaymentService, ship ShippingService) *Orchestrator {
+    return &Orchestrator{inventory: inv, payments: pay, shipping: ship}
+}
+
+// PlaceOrder runs the saga. On any failure, it runs compensations in reverse.
+func (o *Orchestrator) PlaceOrder(ctx context.Context, order Order) error {
+    if err := o.inventory.Reserve(ctx, order.ID, order.Items); err != nil {
+        return fmt.Errorf("reserve inventory: %w", err)
+    }
+
+    if err := o.payments.Charge(ctx, order.ID, order.TotalCents); err != nil {
+        _ = o.inventory.Release(ctx, order.ID)
+        return fmt.Errorf("charge payment: %w", err)
+    }
+
+    if err := o.shipping.CreateShipment(ctx, order.ID, order.Address); err != nil {
+        _ = o.payments.Refund(ctx, order.ID)
+        _ = o.inventory.Release(ctx, order.ID)
+        return fmt.Errorf("create shipment: %w", err)
+    }
+
+    return nil
+}
+```
+
+Orchestration is easier to start with. Use choreography when teams need to add new reactions to existing events without touching the orchestrator.
+
+### Q30. How do you implement compensations?
+
+Each compensation must be **idempotent**: safe to call multiple times. If the compensation itself fails, the saga framework will retry it. It must produce the same result whether called once or ten times.
+
+```go title="compensations.go"
+package inventory
+
+import (
+    "context"
+    "database/sql"
+    "fmt"
+)
+
+// ReleaseReservation is a compensation for Reserve.
+// It is safe to call multiple times: if the reservation does not exist,
+// it returns nil (already released or never created).
+func ReleaseReservation(ctx context.Context, db *sql.DB, orderID string) error {
+    result, err := db.ExecContext(ctx,
+        `DELETE FROM reservations WHERE order_id = $1`,
+        orderID,
+    )
+    if err != nil {
+        return fmt.Errorf("release reservation %s: %w", orderID, err)
+    }
+    rows, _ := result.RowsAffected()
+    if rows == 0 {
+        return nil // already released or never existed, that is fine
+    }
+    return nil
+}
+```
+
+Some compensations cannot be exact inverses. An email already sent cannot be unsent. Use a logical compensation (send a cancellation email) or design your workflow to avoid irreversible steps early.
+
+### Q31. What role does the outbox play in saga steps?
+
+Each saga step must atomically: (a) update local state and (b) publish an event for the next step. If you update the database and then try to publish, the publish can fail after the database write succeeds. The systems diverge.
+
+The outbox pattern solves this. See the Data Consistency section below for the full implementation.
+
+---
+
+> **Q32-Q36** (event-driven architecture, CQRS, event sourcing, distributed tracing, Prometheus metrics) are covered in the [Senior post](/blogs/ms-architecture-interview-03-senior) — they build on the patterns from this post and require hands-on experience to answer well.
+
+## Data Consistency
+
+### Q37. Why is "one database per service" a hard rule?
+
+If two services share a database:
+
+- Schema changes break both services at once. You cannot deploy them independently.
+- One service's heavy queries slow down the other service's queries.
+- You have recreated the monolith at the data layer, defeating the purpose of microservices.
+
+Each service must own its data. Other services access it only through the owning service's API.
+
+### Q38. What is the dual-write problem?
+
+When a service needs to write to two systems (its database and a message broker), and the second write fails after the first succeeds, the systems diverge:
+
+```
+1. BEGIN transaction
+2. INSERT INTO orders (...)    -- succeeds
+3. COMMIT                      -- succeeds
+4. Publish "order.created" to Kafka  -- network blip, fails
+
+Result: order exists in DB, no event published.
+        Email service never sends confirmation.
+        Inventory service never decrements stock.
+```
+
+Adding a `try/catch` does not fix it. Even if you catch the error and retry, your process might crash between steps 3 and 4. After restart, you have no way to know which orders were published and which were not.
+
+### Q39. What is the transactional outbox pattern?
+
+Write the event into an `outbox` table in the same database transaction as the data change. A relay process reads the outbox and publishes to the broker. The event publishes if and only if the data change committed.
+
+```go title="outbox.go"
+package orders
+
+import (
+    "context"
+    "database/sql"
+    "encoding/json"
+    "fmt"
+)
+
+type Order struct {
+    ID         string
+    CustomerID string
+    TotalCents int
+}
+
+// PlaceOrder writes the order and an outbox event in one atomic transaction.
+func PlaceOrder(ctx context.Context, db *sql.DB, order Order) error {
+    tx, err := db.BeginTx(ctx, nil)
+    if err != nil {
+        return fmt.Errorf("begin tx: %w", err)
+    }
+    defer tx.Rollback()
+
+    _, err = tx.ExecContext(ctx,
+        `INSERT INTO orders (id, customer_id, total_cents, status)
+         VALUES ($1, $2, $3, 'pending')`,
+        order.ID, order.CustomerID, order.TotalCents,
+    )
+    if err != nil {
+        return fmt.Errorf("insert order: %w", err)
+    }
+
+    payload, err := json.Marshal(map[string]string{
+        "order_id":    order.ID,
+        "customer_id": order.CustomerID,
+    })
+    if err != nil {
+        return fmt.Errorf("marshal payload: %w", err)
+    }
+
+    _, err = tx.ExecContext(ctx,
+        `INSERT INTO outbox (event_type, payload, created_at, published)
+         VALUES ($1, $2, NOW(), false)`,
+        "order.created", payload,
+    )
+    if err != nil {
+        return fmt.Errorf("insert outbox: %w", err)
+    }
+
+    return tx.Commit()
+}
+```
+
+The relay reads unpublished outbox rows and publishes them to Kafka:
+
+```go title="outbox_relay.go"
+package relay
+
+import (
+    "context"
+    "database/sql"
+    "encoding/json"
+    "fmt"
+    "time"
+)
+
+type Broker interface {
+    Publish(ctx context.Context, topic string, payload []byte) error
+}
+
+// Run polls the outbox and publishes unpublished events.
+func Run(ctx context.Context, db *sql.DB, broker Broker) {
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-time.After(500 * time.Millisecond):
+            if err := publishBatch(ctx, db, broker); err != nil {
+                fmt.Printf("relay error: %v\n", err)
+            }
+        }
+    }
+}
+
+func publishBatch(ctx context.Context, db *sql.DB, broker Broker) error {
+    rows, err := db.QueryContext(ctx,
+        `SELECT id, event_type, payload FROM outbox
+         WHERE published = false
+         ORDER BY created_at
+         LIMIT 100`,
+    )
+    if err != nil {
+        return fmt.Errorf("query outbox: %w", err)
+    }
+    defer rows.Close()
+
+    for rows.Next() {
+        var id int
+        var eventType string
+        var payload json.RawMessage
+
+        if err := rows.Scan(&id, &eventType, &payload); err != nil {
+            return fmt.Errorf("scan row: %w", err)
+        }
+
+        if err := broker.Publish(ctx, eventType, payload); err != nil {
+            return fmt.Errorf("publish event %d: %w", id, err)
+        }
+
+        if _, err := db.ExecContext(ctx,
+            `UPDATE outbox SET published = true WHERE id = $1`, id,
+        ); err != nil {
+            return fmt.Errorf("mark published %d: %w", id, err)
+        }
+    }
+    return rows.Err()
+}
+```
+
+In production, use Change Data Capture (CDC) with a tool like Debezium instead of polling. Debezium tails the Postgres write-ahead log and publishes changes to Kafka without polling overhead.
+
+### Q40. What is the inbox pattern?
+
+The mirror of the outbox, on the consumer side. Before processing an event, write its ID to an `inbox` table. If the ID already exists, skip processing. This makes consumers idempotent against broker redelivery.
+
+```go title="inbox.go"
+package consumer
+
+import (
+    "context"
+    "database/sql"
+    "fmt"
+)
+
+func processEvent(ctx context.Context, db *sql.DB, eventID, eventType string, process func() error) error {
+    // Check inbox: have we seen this event before?
+    var exists bool
+    err := db.QueryRowContext(ctx,
+        `SELECT EXISTS(SELECT 1 FROM inbox WHERE event_id = $1)`, eventID,
+    ).Scan(&exists)
+    if err != nil {
+        return fmt.Errorf("check inbox: %w", err)
+    }
+    if exists {
+        return nil // already processed, skip
+    }
+
+    // Process the event.
+    if err := process(); err != nil {
+        return err
+    }
+
+    // Mark as processed.
+    _, err = db.ExecContext(ctx,
+        `INSERT INTO inbox (event_id, event_type, processed_at) VALUES ($1, $2, NOW())`,
+        eventID, eventType,
+    )
+    return err
+}
+```
+
+### Q41. What is Change Data Capture?
+
+Change Data Capture (CDC) mirrors every insert, update, and delete from a database into a stream by reading the database's internal transaction log (the WAL in Postgres, the binlog in MySQL). No application code change is needed. Other services consume the change stream instead of querying the database directly.
+
+```
+Postgres WAL --> [Debezium connector] --> [Kafka topic: orders.cdc] --> consumers
+```
+
+CDC is the production-grade implementation of the outbox relay. Instead of a polling loop, Debezium reads changes directly from the WAL the moment they are committed.
+
+### Q42. What is eventual consistency?
+
+After a write, different services see the new state at different times. The system is not immediately consistent, but it becomes consistent after the event propagates.
+
+```
+T+0ms:   User updates email in user-service. users_db reflects new email.
+T+50ms:  order-service still shows the old email (cached or not yet received event).
+T+200ms: "user.updated" event arrives. order-service updates its local copy.
+T+200ms onward: all services show the new email.
+```
+
+Most microservices systems are eventually consistent. UI needs to handle the gap: show the new state optimistically, reconcile when the event confirms it.
+
+### Q43. What patterns help with read-after-write consistency?
+
+Three approaches:
+
+1. **Route the next read to the primary**: the write goes to the primary database; immediately after, route the user's next read to the primary before they can see a stale replica.
+2. **Synchronous wait**: the write does not return until the event has been applied to relevant read views. Slower but stronger guarantee.
+3. **Optimistic UI update**: the client immediately shows the change in the UI. If the eventual event contradicts it, reconcile. This is what most social and e-commerce apps do.
+
+---
+
+## Idempotency
+
+### Q44. Why is idempotency the most important property in distributed systems?
+
+Networks fail. Retries are unavoidable. If handling the same request twice produces the same result as handling it once, retries are safe. If not, retries produce duplicate orders, double charges, and double emails.
+
+```go title="idempotency_contrast.go"
+package main
+
+import (
+    "context"
+    "database/sql"
+)
+
+// Not idempotent: each call decrements stock regardless of whether
+// we have already processed this order.
+func decrementStock(ctx context.Context, db *sql.DB, sku string, qty int) error {
+    _, err := db.ExecContext(ctx,
+        `UPDATE inventory SET qty = qty - $1 WHERE sku = $2`,
+        qty, sku,
+    )
+    return err
+}
+
+// Idempotent: keyed by orderID. Second call with the same orderID is a no-op.
+func reserveStock(ctx context.Context, db *sql.DB, orderID, sku string, qty int) error {
+    // Check if we have already reserved for this order.
+    var exists bool
+    err := db.QueryRowContext(ctx,
+        `SELECT EXISTS(SELECT 1 FROM reservations WHERE order_id = $1)`, orderID,
+    ).Scan(&exists)
+    if err != nil {
+        return err
+    }
+    if exists {
+        return nil // already reserved, safe to return success
+    }
+
+    tx, err := db.BeginTx(ctx, nil)
+    if err != nil {
+        return err
+    }
+    defer tx.Rollback()
+
+    if _, err = tx.ExecContext(ctx,
+        `INSERT INTO reservations (order_id, sku, qty) VALUES ($1, $2, $3)`,
+        orderID, sku, qty,
+    ); err != nil {
+        return err
+    }
+
+    if _, err = tx.ExecContext(ctx,
+        `UPDATE inventory SET qty = qty - $1 WHERE sku = $2`,
+        qty, sku,
+    ); err != nil {
+        return err
+    }
+
+    return tx.Commit()
+}
+```
+
+The first version is dangerous with retries. The second is safe because the reservation table enforces that each order only decrements stock once.
+
+### Q45. How do you make non-idempotent operations idempotent?
+
+The client passes an `Idempotency-Key` header with a unique ID (UUID) for the request. The server stores the key and the response. If the same key arrives again, return the cached response without re-processing.
+
+```go title="idempotency_middleware.go"
+package idempotency
+
+import (
+    "bytes"
+    "context"
+    "net/http"
+    "sync"
+)
+
+type CachedResponse struct {
+    StatusCode int
+    Body       []byte
+}
+
+type Store interface {
+    Load(ctx context.Context, key string) (CachedResponse, bool)
+    Save(ctx context.Context, key string, resp CachedResponse)
+}
+
+// responseRecorder captures the response so we can cache it.
+type responseRecorder struct {
+    http.ResponseWriter
+    statusCode int
+    buf        bytes.Buffer
+}
+
+func (r *responseRecorder) WriteHeader(code int)          { r.statusCode = code; r.ResponseWriter.WriteHeader(code) }
+func (r *responseRecorder) Write(b []byte) (int, error)   { r.buf.Write(b); return r.ResponseWriter.Write(b) }
+
+// Middleware wraps an HTTP handler with idempotency key support.
+func Middleware(store Store, next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        key := r.Header.Get("Idempotency-Key")
+        if key == "" {
+            next.ServeHTTP(w, r)
+            return
+        }
+
+        if cached, ok := store.Load(r.Context(), key); ok {
+            w.WriteHeader(cached.StatusCode)
+            w.Write(cached.Body)
+            return
+        }
+
+        rec := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
+        next.ServeHTTP(rec, r)
+        store.Save(r.Context(), key, CachedResponse{
+            StatusCode: rec.statusCode,
+            Body:       rec.buf.Bytes(),
+        })
+    })
+}
+
+// MemStore is an in-memory idempotency store for testing.
+type MemStore struct {
+    mu    sync.RWMutex
+    cache map[string]CachedResponse
+}
+
+func NewMemStore() *MemStore {
+    return &MemStore{cache: make(map[string]CachedResponse)}
+}
+
+func (s *MemStore) Load(_ context.Context, key string) (CachedResponse, bool) {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    v, ok := s.cache[key]
+    return v, ok
+}
+
+func (s *MemStore) Save(_ context.Context, key string, resp CachedResponse) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    s.cache[key] = resp
+}
+```
+
+Call the payments endpoint with an idempotency key:
+
+```http
+POST /payments HTTP/1.1
+Idempotency-Key: 9f2b3e7a-8c41-4a2e-b15d-3f9a2c5e7b1d
+Content-Type: application/json
+
+{"order_id": "ord-123", "amount_cents": 4999}
+```
+
+If the network drops and the client retries with the same key, the server returns the original response without charging the card again.
+
+### Q46. Is exactly-once delivery possible?
+
+Across a network, no. You can achieve at-most-once delivery (the message might be lost) or at-least-once delivery (the message is delivered but might be duplicated). True exactly-once delivery requires consensus between both sides at every moment, including failure moments.
+
+What is achievable: **effectively-once processing** by combining at-least-once delivery with an idempotent consumer. The broker may deliver the same message twice. The consumer detects the duplicate using the inbox pattern or an idempotency key and skips the second delivery.
+
+Kafka's exactly-once semantics work within Kafka itself. The moment your consumer writes to an external system (a database, an HTTP endpoint), you are back to at-least-once at the application layer.
+
+---
+
+## How to Get Better at This
+
+### Build It
+
+**Circuit breaker**: implement it from scratch without using a library. Write tests that inject failures and verify the state transitions: closed to open after the threshold, open rejects immediately, half-open allows one test request, reopens on failure, closes on success.
+
+**Saga with outbox**: build a two-service system where placing an order:
+1. Writes to `orders` and `outbox` in one Postgres transaction.
+2. A relay goroutine reads the outbox and publishes to an in-process channel (simulating Kafka).
+3. An inventory service consumes from the channel and decrements stock.
+4. Kill the relay mid-flight and verify the system recovers without data loss.
+
+### Read
+
+- **"Designing Data-Intensive Applications" by Martin Kleppmann** (chapters 7-9) covers distributed transactions, consensus, and consistency models better than any other single source.
+- **"Release It!" by Michael Nygard** is where the circuit breaker, bulkhead, and timeout patterns were popularized. The examples are Java but the concepts are universal.
+
+### Practice
+
+Identify three places in a codebase you know where a network call is made without a timeout. Add timeouts. Then identify one operation that is called with retry and ask: is it idempotent? If not, design an idempotency key scheme for it.
+
+---
+
+## Next in This Series
+
+[Microservices Architecture Interview Questions: Senior](/blogs/ms-architecture-interview-03-senior) covers event-driven architecture, CQRS, event sourcing, observability with OpenTelemetry in Go, testing strategies (contract tests, chaos testing), canary deployments, service mesh, and when microservices are the wrong choice.

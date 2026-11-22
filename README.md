@@ -90,11 +90,11 @@ rishu-portfolio/
 # Install dependencies
 npm install
 
-# Start dev server with Turbopack
-npm run dev
+# Start dev server with Turbopack on port 3005
+npm run dev -- --port 3005
 ```
 
-Open [http://localhost:3000](http://localhost:3000).
+Open [http://localhost:3005](http://localhost:3005).
 
 ```bash
 # Type check + lint

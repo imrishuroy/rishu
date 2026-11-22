@@ -1,6 +1,7 @@
 import Link from 'next/link'
 import { formatDate } from '@/lib/utils'
 import type { PostMeta } from '@/lib/posts'
+import SeriesBadge from '@/components/blog/SeriesBadge'
 
 interface PostCardProps {
   post: PostMeta
@@ -13,6 +14,13 @@ export default function PostCard({ post }: PostCardProps) {
       className="group p-6 rounded-xl bg-surface-container border border-outline-variant/40 hover:border-primary/40 transition-all flex flex-col justify-between"
     >
       <div className="space-y-3">
+        {/* Series badge */}
+        {post.series && (
+          <div>
+            <SeriesBadge series={post.series} order={post.seriesOrder} />
+          </div>
+        )}
+
         {/* Tags + read time */}
         <div className="flex items-center justify-between text-xs font-mono text-outline">
           <div className="flex items-center gap-2 flex-wrap">
@@ -43,7 +51,11 @@ export default function PostCard({ post }: PostCardProps) {
       <div className="pt-4 mt-4 border-t border-outline-variant/20 flex items-center justify-between">
         <span className="text-xs text-on-surface-variant font-mono">{post.date ? formatDate(post.date) : '—'}</span>
         <div className="flex items-center gap-1 text-xs text-primary text-label-sm">
-          <span>Read Architecture Note</span>
+          <span>
+            {post.series && post.seriesOrder
+              ? `Read Chapter ${post.seriesOrder}`
+              : 'Read Architecture Note'}
+          </span>
           <span className="material-symbols-outlined text-sm">arrow_outward</span>
         </div>
       </div>
